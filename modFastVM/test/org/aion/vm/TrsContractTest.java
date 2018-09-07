@@ -34,7 +34,7 @@ import org.slf4j.Logger;
 public class TrsContractTest {
     private static final Logger LOGGER_VM = AionLoggerFactory.getLogger(LogEnum.VM.toString());
     private static final long NRG = 1_000_000, NRG_PRICE = 1;
-    private static BigInteger nonce;
+    private static final BigInteger DEFAULT_BALANCE = new BigInteger("1000000000");
     private StandaloneBlockchain blockchain;
     private ECKey deployerKey;
     private Address deployer;
@@ -51,7 +51,6 @@ public class TrsContractTest {
         deployer = new Address(deployerKey.getAddress());
         deployerBalance = Builder.DEFAULT_BALANCE;
         deployerNonce = BigInteger.ZERO;
-        nonce = BigInteger.ZERO;
     }
 
     @After
@@ -61,12 +60,85 @@ public class TrsContractTest {
         deployer = null;
         deployerBalance = null;
         deployerNonce = null;
-        nonce = null;
+    }
+
+    // NOTE -- if you change the Savings.sol file then update the TRSdeployCode() method with the
+    // correct binary!
+
+    /**
+     * Tests we can query the start time of the contract.
+     */
+    @Test
+    public void testStartTimeQuery() {
+        int periods = 4;
+        int t0special = 1;
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+
+        // Before the contract starts the start time should be zero.
+        assertEquals(0, TRSgetStartTime(trsContract, repo));
+        lockTRScontract(trsContract, repo);
+        assertEquals(0, TRSgetStartTime(trsContract, repo));
+
+        // Contract is live and uses timestamp of current best block.
+        startTRScontract(trsContract, repo);
+        assertEquals(blockchain.getBestBlock().getTimestamp(), TRSgetStartTime(trsContract, repo));
     }
 
     /**
-     * Tests the query functionality isStart -- tells us whether the contract is currently live or
-     * not.
+     * Tests we can query the number of periods in the contract.
+     */
+    @Test
+    public void testPeriodsQuery() {
+        int periods = RandomUtils.nextInt(10, 100_000);
+        int t0special = 1;
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+        assertEquals(periods, TRSgetNumPeriods(trsContract, repo));
+    }
+
+    /**
+     * Tests we can query the special one-off multiplier.
+     */
+    @Test
+    public void testSpecialMultiplierQuery() {
+        int periods = 4;
+        int t0special = RandomUtils.nextInt(0, 100_000);
+
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+        assertEquals(t0special, TRSgetT0special(trsContract, repo));
+    }
+
+    /**
+     * Tests we can query whether the contract is locked or not.
+     */
+    @Test
+    public void testIsLockedQuery() {
+        int periods = 4;
+        int t0special = 1;
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+        assertFalse(TRSisLocked(trsContract, repo));
+
+        lockTRScontract(trsContract, repo);
+        assertTrue(TRSisLocked(trsContract, repo));
+
+        // Contract should stay in 'locked' state even while live (started).
+        startTRScontract(trsContract, repo);
+        assertTrue(TRSisLocked(trsContract, repo));
+    }
+
+    /**
+     * Tests we can query whether the contract is started (is live) or not.
      */
     @Test
     public void testIsStartQuery() {
@@ -96,47 +168,250 @@ public class TrsContractTest {
         initTRScontract(trsContract, repo, periods, t0special);
 
         int numAccounts = 1000;
-        BigInteger accountBalances = new BigInteger("5000000");
-        List<Address> accounts = makeAccounts(repo, accountBalances, numAccounts);
-        depositIntoTRScontract(trsContract, repo, accounts, accountBalances);
+        List<BigInteger> balances = getRandomBalances(numAccounts);
+        List<Address> accounts = makeAccounts(repo, DEFAULT_BALANCE, numAccounts);
+        depositIntoTRScontract(trsContract, repo, accounts, balances);
 
-        BigInteger expectedFacevalue = accountBalances.multiply(BigInteger.valueOf(numAccounts));
+        BigInteger expectedFacevalue = sumOf(balances);
         assertEquals(expectedFacevalue, TRSgetTotalFacevalue(trsContract, repo));
 
         // Once account is locked we expect that no more deposits can be made.
         lockTRScontract(trsContract, repo);
         assertTrue(TRSisLocked(trsContract, repo));
         numAccounts = 200;
-        accounts = makeAccounts(repo, accountBalances, numAccounts);
-        depositIntoTRScontractWillFail(trsContract, repo, accounts, accountBalances);
+        balances = getRandomBalances(numAccounts);
+        accounts = makeAccounts(repo, DEFAULT_BALANCE, numAccounts);
+        depositIntoTRScontractWillFail(trsContract, repo, accounts, balances);
         assertEquals(expectedFacevalue, TRSgetTotalFacevalue(trsContract, repo));
 
         // Now we start the contract and still expect no deposits can be made.
         startTRScontract(trsContract, repo);
         assertTrue(TRSisStarted(trsContract, repo));
-        accounts = makeAccounts(repo, accountBalances, numAccounts);
-        depositIntoTRScontractWillFail(trsContract, repo, accounts, accountBalances);
+        accounts = makeAccounts(repo, DEFAULT_BALANCE, numAccounts);
+        depositIntoTRScontractWillFail(trsContract, repo, accounts, balances);
         assertEquals(expectedFacevalue, TRSgetTotalFacevalue(trsContract, repo));
     }
 
+    /**
+     * TODO: in process.
+     */
     @Test
     public void testWithdrawalsOverFullContractLifetime() {
+        int numDepositors = 1_000;
         int periods = 4;
         int t0special = 1;
         IRepositoryCache repo = blockchain.getRepository().startTracking();
 
-        Address trsContract = deployTRScontract(repo);
-        initTRScontract(trsContract, repo, periods, t0special);
+        // After this call we know all accounts have deposited all their funds into trsContract.
+        ObjectHolder holder = setupTRScontractWithDeposits(repo, periods, t0special, numDepositors);
+        Address trsContract = (Address) holder.grabObjectAtPosition(0);
+        List<Address> accounts = (List<Address>) holder.grabObjectAtPosition(1);
+        List<BigInteger> balances = (List<BigInteger>) holder.grabObjectAtPosition(2);
 
-        BigInteger amount = BigInteger.TEN;
-        Address depositor = makeAccount(repo, amount);
-        depositIntoTRScontract(trsContract, repo, depositor, amount);
-
-        BigInteger amt = TRSgetTotalFacevalue(trsContract, repo);
-        assertEquals(BigInteger.TEN, amt);
+        int i = 0;
+        for (Address account : accounts) {
+            assertEquals(balances.get(i), TRSgetAccountDeposited(trsContract, repo, account));
+            i++;
+        }
+        assertEquals(sumOf(balances), TRSgetTotalFunds(trsContract, repo));
     }
 
     //<----------------------------------------HELPERS--------------------------------------------->
+
+    /**
+     * Returns the fraction of the total funds owed to an account for some current period
+     * currentPeriod for a contract that has numPeriods periods and whose special one-off multiplier
+     * is t0special.
+     *
+     * @param t0special The special one-off multiplier of some contract.
+     * @param currentPeriod The current period of some contract.
+     * @param numPeriods The number of periods in some contract.
+     * @return the fraction of total funds owed to some account for some contract.
+     */
+    private static int fraction(int t0special, int currentPeriod, int numPeriods) {
+        return (t0special + currentPeriod) / (t0special + numPeriods);
+    }
+
+    /**
+     * Returns the total amount of coins that account will be able to collect over the lifetime of
+     * the TRS contract at address trsContract. It must be that account cannot claim more than this
+     * amount after arbitrarily many withdrawals over every period of the contract and it also must
+     * be that account will receive this full amount iff account makes at least one withdrawal in
+     * the final period of the contract.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param account The account whose owed funds is to be computed.
+     * @return the total amount of funds owed to account over the contract's lifetime.
+     */
+    private BigInteger computeTotalOwed(Address trsContract, IRepositoryCache repo, Address account) {
+        BigInteger facevalue = TRSgetTotalFacevalue(trsContract, repo);
+        BigInteger deposited = TRSgetAccountDeposited(trsContract, repo, account);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        return (deposited.divide(facevalue)).multiply(totalFunds);
+    }
+
+    /**
+     * Returns the timestamp of the block the TRS contract at address trsContract went live (was
+     * started) at.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @return the start time of the contract.
+     */
+    private long TRSgetStartTime(Address trsContract, IRepositoryCache repo) {
+        byte[] input = Hex.decode("ac3dc9aa");
+        BigInteger value = BigInteger.ZERO;
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
+
+        BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
+            Collections.singletonList(tx), false);
+        TransactionExecutor exec = new TransactionExecutor(tx, context.block, repo, LOGGER_VM);
+        exec.setExecutorProvider(new TestVMProvider());
+        exec.execute();
+        ExecutionResult result = (ExecutionResult) exec.getResult();
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+        return new BigInteger(result.getOutput()).longValueExact();
+    }
+
+    /**
+     * Returns the number of periods in the TRS contract at address trsContract.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @return the number of periods in the contract.
+     */
+    private int TRSgetNumPeriods(Address trsContract, IRepositoryCache repo) {
+        byte[] input = Hex.decode("a4caeb42");
+        BigInteger value = BigInteger.ZERO;
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
+
+        BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
+            Collections.singletonList(tx), false);
+        TransactionExecutor exec = new TransactionExecutor(tx, context.block, repo, LOGGER_VM);
+        exec.setExecutorProvider(new TestVMProvider());
+        exec.execute();
+        ExecutionResult result = (ExecutionResult) exec.getResult();
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+        return new BigInteger(result.getOutput()).intValueExact();
+    }
+
+    /**
+     * Returns the t0special one-off multiplier for the TRS contract at address trsContract.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @return the one-off special multiplier.
+     */
+    private int TRSgetT0special(Address trsContract, IRepositoryCache repo) {
+        byte[] input = Hex.decode("90e2b94b");
+        BigInteger value = BigInteger.ZERO;
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
+
+        BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
+            Collections.singletonList(tx), false);
+        TransactionExecutor exec = new TransactionExecutor(tx, context.block, repo, LOGGER_VM);
+        exec.setExecutorProvider(new TestVMProvider());
+        exec.execute();
+        ExecutionResult result = (ExecutionResult) exec.getResult();
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+        return new BigInteger(result.getOutput()).intValueExact();
+    }
+
+    /**
+     * Returns the total amount of funds in the TRS contract at address trsContract. This amount is
+     * lower bounded by the total "face value" amount, which is the amount that was explicitly
+     * deposited by depositors, and may be larger than this amount if bonus deposits are made.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @return the total funds in the contract.
+     */
+    private BigInteger TRSgetTotalFunds(Address trsContract, IRepositoryCache repo) {
+        byte[] input = Hex.decode("2ddbd13a");
+        BigInteger value = BigInteger.ZERO;
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
+
+        BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
+            Collections.singletonList(tx), false);
+        TransactionExecutor exec = new TransactionExecutor(tx, context.block, repo, LOGGER_VM);
+        exec.setExecutorProvider(new TestVMProvider());
+        exec.execute();
+        ExecutionResult result = (ExecutionResult) exec.getResult();
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+        return new BigInteger(result.getOutput());
+    }
+
+    /**
+     * Returns the amount of coins that account has deposited into the TRS contract at address
+     * trsContract.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param account The account whose deposit balance is to be queried.
+     * @return the amount of coins account has deposited.
+     */
+    private BigInteger TRSgetAccountDeposited(Address trsContract, IRepositoryCache repo, Address account) {
+        byte[] input = ByteUtil.merge(Hex.decode("cb13cddb"), account.toBytes());
+        BigInteger value = BigInteger.ZERO;
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
+
+        BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
+            Collections.singletonList(tx), false);
+        TransactionExecutor exec = new TransactionExecutor(tx, context.block, repo, LOGGER_VM);
+        exec.setExecutorProvider(new TestVMProvider());
+        exec.execute();
+        ExecutionResult result = (ExecutionResult) exec.getResult();
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+        return new BigInteger(result.getOutput());
+    }
+
+    /**
+     * This method will deploy a new TRS contract and will create numDepositors random accounts,
+     * each with a random balance in [1000, 100000000] and will have each such account deposit its
+     * full funds into the contract. The contract will then be locked and made live.
+     *
+     * The returned ObjectHolder will hold the following 3 objects:
+     *   Address --             contract deploy address
+     *   List<Address> --       list of depositors
+     *   List<BigInteger> --    list of deposit amounts
+     *
+     * such that the two lists are the same size and the i'th account corresponds to the i'th amount.
+     */
+    private ObjectHolder setupTRScontractWithDeposits(IRepositoryCache repo, int periods,
+        int t0special, int numDepositors) {
+
+        ObjectHolder holder = new ObjectHolder();
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+        List<BigInteger> balances = getRandomBalances(numDepositors);
+        List<Address> accounts = makeAccounts(repo, DEFAULT_BALANCE, balances.size());
+        depositIntoTRScontract(trsContract, repo, accounts, balances);
+        BigInteger expectedFacevalue = sumOf(balances);
+        assertEquals(expectedFacevalue, TRSgetTotalFacevalue(trsContract, repo));
+        lockTRScontract(trsContract, repo);
+        startTRScontract(trsContract, repo);
+        assertTrue(TRSisLocked(trsContract, repo));
+        assertTrue(TRSisStarted(trsContract, repo));
+        wipeAllBalances(repo, accounts);
+        assertAllAccountsHaveZeroBalance(repo, accounts);
+
+        holder.placeObject(trsContract);
+        holder.placeObject(accounts);
+        holder.placeObject(balances);
+        return holder;
+    }
 
     /**
      * Each account in depositors attempts to deposit amounts number of coins into the TRS contract
@@ -148,12 +423,15 @@ public class TrsContractTest {
      * @param amounts the amounts for each account to attempt to deposit.
      */
     private void depositIntoTRScontractWillFail(Address trsContract, IRepositoryCache repo,
-        List<Address> depositors, BigInteger amounts) {
+        List<Address> depositors, List<BigInteger> amounts) {
 
+        assertEquals(depositors.size(), amounts.size());
+        int i = 0;
         for (Address account : depositors) {
-            assertTrue(repo.getBalance(account).compareTo(amounts) >= 0);
-            sendCoinsToTRScontract(trsContract, repo, amounts);
-            depositOfBehalfOf(trsContract, repo, account, amounts, false);
+            assertTrue(repo.getBalance(account).compareTo(amounts.get(i)) >= 0);
+            sendCoinsToTRScontract(trsContract, repo, account, amounts.get(i));
+            depositOfBehalfOf(trsContract, repo, account, amounts.get(i), false);
+            i++;
         }
     }
 
@@ -167,12 +445,15 @@ public class TrsContractTest {
      * @param amounts The amounts for each account to deposit.
      */
     private void depositIntoTRScontract(Address trsContract, IRepositoryCache repo,
-        List<Address> depositors, BigInteger amounts) {
+        List<Address> depositors, List<BigInteger> amounts) {
 
+        assertEquals(depositors.size(), amounts.size());
+        int i = 0;
         for (Address account : depositors) {
-            assertTrue(repo.getBalance(account).compareTo(amounts) >= 0);
-            sendCoinsToTRScontract(trsContract, repo, amounts);
-            depositOfBehalfOf(trsContract, repo, account, amounts, true);
+            assertTrue(repo.getBalance(account).compareTo(amounts.get(i)) >= 0);
+            sendCoinsToTRScontract(trsContract, repo, account, amounts.get(i));
+            depositOfBehalfOf(trsContract, repo, account, amounts.get(i), true);
+            i++;
         }
     }
 
@@ -188,7 +469,7 @@ public class TrsContractTest {
         Address depositor, BigInteger amount) {
 
         assertTrue(repo.getBalance(depositor).compareTo(amount) >= 0);
-        sendCoinsToTRScontract(trsContract, repo, amount);
+        sendCoinsToTRScontract(trsContract, repo, depositor, amount);
         depositOfBehalfOf(trsContract, repo, depositor, amount, true);
     }
 
@@ -202,10 +483,9 @@ public class TrsContractTest {
     private boolean TRSisLocked(Address trsContract, IRepositoryCache repo) {
         byte[] input = Hex.decode("cf309012");
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -228,10 +508,9 @@ public class TrsContractTest {
     private BigInteger TRSgetTotalFacevalue(Address trsContract, IRepositoryCache repo) {
         byte[] input = Hex.decode("c3af702e");
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -261,10 +540,9 @@ public class TrsContractTest {
         byte[] input = ByteUtil.merge(Hex.decode("184274fc"), beneficiary.toBytes());
         input = ByteUtil.merge(input, new DataWord(amount).getData());
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -287,15 +565,17 @@ public class TrsContractTest {
      *
      * @param trsContract Address of deployed TRS contract.
      * @param repo The repo.
+     * @param sender The sending account.
      * @param amount The amount to send.
      */
-    private void sendCoinsToTRScontract(Address trsContract, IRepositoryCache repo, BigInteger amount) {
-        assertTrue(repo.getBalance(deployer).compareTo(amount) >= 0);
+    private void sendCoinsToTRScontract(Address trsContract, IRepositoryCache repo, Address sender,
+        BigInteger amount) {
+
+        assertTrue(repo.getBalance(sender).compareTo(amount) >= 0);
         BigInteger contractPrevBalance = repo.getBalance(trsContract);
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract,
+        BigInteger nonce = repo.getNonce(sender);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), sender, trsContract,
             amount.toByteArray(), new byte[1], NRG, NRG_PRICE);
-        tx.sign(deployerKey);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -317,10 +597,9 @@ public class TrsContractTest {
     private BigInteger TRSgetRemainder(Address trsContract, IRepositoryCache repo) {
         byte[] input = Hex.decode("a0684251");
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -341,10 +620,9 @@ public class TrsContractTest {
         long startTime = blockchain.getBestBlock().getTimestamp();
         byte[] input = ByteUtil.merge(Hex.decode("2392b0f0"), new DataWord(startTime).getData());
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -365,10 +643,9 @@ public class TrsContractTest {
     private void lockTRScontract(Address trsContract, IRepositoryCache repo) {
         byte[] input = org.aion.base.util.Hex.decode("f83d08ba");
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -390,10 +667,9 @@ public class TrsContractTest {
     private boolean TRSisStarted(Address trsContract, IRepositoryCache repo) {
         byte[] input = Hex.decode("544736e6");
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -419,10 +695,9 @@ public class TrsContractTest {
         byte[] input = ByteUtil.merge(Hex.decode("a191fe28"), new DataWord(periods).getData());
         input = ByteUtil.merge(input, new DataWord(t0special).getData());
         BigInteger value = BigInteger.ZERO;
-        nonce = nonce.add(BigInteger.ONE);
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
-            input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
+        BigInteger nonce = repo.getNonce(deployer);
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract,
+            value.toByteArray(), input, NRG, NRG_PRICE);
 
         BlockContext context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -436,9 +711,8 @@ public class TrsContractTest {
         // finalize the contract init.
         input = Hex.decode("72a02f1d");
         nonce = nonce.add(BigInteger.ONE);
-        tx = new AionTransaction(nonce.toByteArray(), trsContract, value.toByteArray(),
+        tx = new AionTransaction(nonce.toByteArray(), deployer, trsContract, value.toByteArray(),
             input, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
 
         context = blockchain.createNewBlockContext(blockchain.getBestBlock(),
             Collections.singletonList(tx), false);
@@ -457,17 +731,17 @@ public class TrsContractTest {
      * @return the TRS contract address.
      */
     private Address deployTRScontract(IRepositoryCache repo) {
-        Address contract = deployContract(repo, getDeployTx());
+        Address contract = deployContract(repo, getDeployTx(repo));
         addBlock();
         return contract;
     }
 
-    private AionTransaction getDeployTx() {
+    private AionTransaction getDeployTx(IRepositoryCache repo) {
         byte[] deployCode = Hex.decode(TRSdeployCode());
+        BigInteger nonce = repo.getNonce(deployer);
         BigInteger value = BigInteger.ZERO;
-        AionTransaction tx = new AionTransaction(nonce.toByteArray(), null, value.toByteArray(),
+        AionTransaction tx = new AionTransaction(nonce.toByteArray(), deployer, null, value.toByteArray(),
             deployCode, NRG, NRG_PRICE);
-        tx.sign(deployerKey);
         return tx;
     }
 
@@ -495,24 +769,6 @@ public class TrsContractTest {
     }
 
     /**
-     * Deploys inside a block and adds to chain.
-     */
-    private Address deployContractInBlock(IRepositoryCache repo, AionTransaction tx) {
-        tx.sign(deployerKey);
-        assertTrue(tx.isContractCreation());
-        assertEquals(deployerBalance, repo.getBalance(deployer));
-        assertEquals(deployerNonce, repo.getNonce(deployer));
-
-        AionBlock block = blockchain.createNewBlock(
-            blockchain.getBestBlock(),
-            Collections.singletonList(tx),
-            false);
-        assertEquals(ImportResult.IMPORTED_BEST, blockchain.tryToConnect(block));
-
-        return tx.getContractAddress();
-    }
-
-    /**
      * Returns a Hex String of the deployment code for the TRS contract.
      * @return
      */
@@ -532,13 +788,26 @@ public class TrsContractTest {
     }
 
     /**
-     * Returns a list of numAccounts new random accounts, each of which is saved in repo with
-     * initial balances of initBalances.
+     * Asserts that all addresses in accounts have zero balance. If this condition is untrue then
+     * the calling test will fail.
      *
      * @param repo The repo.
-     * @param initBalances The initial balances for each account.
-     * @param numAccounts The number of new accounts to make.
-     * @return a list of new accounts.
+     * @param accounts the accounts to check.
+     */
+    private static void assertAllAccountsHaveZeroBalance(IRepositoryCache repo, List<Address> accounts) {
+        for (Address account : accounts) {
+            assertEquals(BigInteger.ZERO, repo.getBalance(account));
+        }
+    }
+
+    /**
+     * Returns a list of numAccounts new random accounts, each of which is saved in repo with an
+     * initial balance corresponding to the balance listed in initBalances.
+     *
+     * @param repo the repo.
+     * @param initBalances The initial balances for each accounts.
+     * @param numAccounts The number of accounts.
+     * @return a list of numAccounts new accounts.
      */
     private List<Address> makeAccounts(IRepositoryCache repo, BigInteger initBalances, int numAccounts) {
         List<Address> accounts = new ArrayList<>(numAccounts);
@@ -560,6 +829,71 @@ public class TrsContractTest {
         repo.createAccount(account);
         repo.addBalance(account, balance);
         return account;
+    }
+
+    /**
+     * Returns a list of numBalances random balances in the range [1000, 100000000].
+     *
+     * @param numBalances The size of the list to return.
+     * @return a list of numBalances random balances.
+     */
+    private List<BigInteger> getRandomBalances(int numBalances) {
+        List<BigInteger> balances = new ArrayList<>(numBalances);
+        for (int i = 0; i < numBalances; i++) {
+            balances.add(BigInteger.valueOf(RandomUtils.nextInt(1_000, 100_000_001)));
+        }
+        return balances;
+    }
+
+    /**
+     * Removes all balance from each account in accounts in repo so that each account has zero
+     * balance.
+     */
+    private static void wipeAllBalances(IRepositoryCache repo, List<Address> accounts) {
+        for (Address account : accounts) {
+            BigInteger balance = repo.getBalance(account);
+            repo.addBalance(account, balance.negate());
+            assertEquals(BigInteger.ZERO, repo.getBalance(account));
+        }
+    }
+
+    /**
+     * Returns the sum of all the numbers in nums.
+     *
+     * @param nums The numbers to sum.
+     * @return the sum of nums.
+     */
+    private BigInteger sumOf(List<BigInteger> nums) {
+        BigInteger sum = BigInteger.ZERO;
+        for (BigInteger num : nums) {
+            sum = sum.add(num);
+        }
+        return sum;
+    }
+
+    /**
+     * Simple class that holds a list of objects for methods that require returning multiple diverse
+     * objects.
+     */
+    private class ObjectHolder {
+        private List<Object> holdings;
+
+        ObjectHolder() {
+            this.holdings = new ArrayList<>();
+        }
+
+        void placeObject(Object o) {
+            this.holdings.add(o);
+        }
+
+        Object grabObjectAtPosition(int position) {
+            assertTrue(position <= this.holdings.size() - 1);
+            return this.holdings.get(position);
+        }
+
+        List<Object> grabObjects() {
+            return this.holdings;
+        }
     }
 
 }
