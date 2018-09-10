@@ -397,7 +397,8 @@ contract Savings is Owned {
 		require((diff + _w) <= ((_d * total) / totalfv));
 
 		// transfer and increment
-		require(token.transfer(addr, diff));
+		//require(token.transfer(addr, diff));
+		addr.send(diff);
 
 		withdrawn[addr] += diff;
 		remainder -= diff;
