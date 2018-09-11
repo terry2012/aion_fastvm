@@ -1343,21 +1343,6 @@ public class TrsContractTest {
     }
 
     @Test
-    public void testUpdateTotalSideEffects() {
-        //TODO
-    }
-
-    @Test
-    public void testNullify() {
-        //TODO
-    }
-
-    @Test
-    public void testTransferOwnership() {
-        //TODO
-    }
-
-    @Test
     public void testMultiMint() {
         //TODO
     }
