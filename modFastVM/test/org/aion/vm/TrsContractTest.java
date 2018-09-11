@@ -21,7 +21,10 @@ import org.aion.fastvm.TestVMProvider;
 import org.aion.log.AionLoggerFactory;
 import org.aion.log.LogEnum;
 import org.aion.mcf.core.ImportResult;
+import org.aion.mcf.vm.Constants;
 import org.aion.mcf.vm.types.DataWord;
+import org.aion.solidity.SolidityType;
+import org.aion.solidity.SolidityType.DynamicArrayType;
 import org.aion.vm.AbstractExecutionResult.ResultCode;
 import org.aion.zero.impl.BlockContext;
 import org.aion.zero.impl.StandaloneBlockchain;
@@ -37,9 +40,9 @@ import org.slf4j.Logger;
 
 public class TrsContractTest {
     private static final Logger LOGGER_VM = AionLoggerFactory.getLogger(LogEnum.VM.toString());
-    private static final long NRG = 1_000_000, NRG_PRICE = 1;
     private static final BigInteger DEFAULT_BALANCE = new BigInteger("1000000000");
     private static final int PRECISION = 30;
+    private static long NRG = 1_000_000, NRG_PRICE = 1;
     private StandaloneBlockchain blockchain;
     private ECKey deployerKey;
     private Address deployer;
@@ -186,6 +189,57 @@ public class TrsContractTest {
         lockTRScontract(trsContract, repo);
         startTRScontract(trsContract, repo);
         assertTrue(TRSisStarted(trsContract, repo));
+    }
+
+    /**
+     * Tests we can query the address of the contract's owner correctly.
+     */
+    @Test
+    public void testOwnerQuery() {
+        int periods = 4;
+        int t0special = 1;
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+        Address owner = TRSwhoIsOwner(trsContract, repo);
+        assertEquals(deployer, owner);
+    }
+
+    /**
+     * Tests we can query the address of the contract's new owner correctly.
+     */
+    @Test
+    public void testNewOwnerQuery() {
+        int periods = 4;
+        int t0special = 1;
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+
+        // First try query when the new owner has not yet been set.
+        assertEquals(Address.ZERO_ADDRESS(), TRSwhoIsNewOwner(trsContract, repo));
+
+        // Second try the query when the new owner has been set; assert newOwner is not owner.
+        Address newOwner = makeAccount(repo, DEFAULT_BALANCE);
+        TRSproposeNewOwner(trsContract, repo, newOwner);
+        assertEquals(newOwner, TRSwhoIsNewOwner(trsContract, repo));
+        assertEquals(deployer, TRSwhoIsOwner(trsContract, repo));
+        lockTRScontract(trsContract, repo, newOwner);
+        assertFalse(TRSisLocked(trsContract, repo));
+
+        // Third try the query after the new owner has accepted their role.
+        Address imposter = makeAccount(repo, DEFAULT_BALANCE);
+        TRSacceptOwnership(trsContract, repo, imposter);
+        assertEquals(deployer, TRSwhoIsOwner(trsContract, repo));
+
+        TRSacceptOwnership(trsContract, repo, newOwner);
+        deployer = newOwner;
+        assertEquals(newOwner, TRSwhoIsOwner(trsContract, repo));
+        assertEquals(Address.ZERO_ADDRESS(), TRSwhoIsNewOwner(trsContract, repo));
+        lockTRScontract(trsContract, repo, newOwner);
+        assertTrue(TRSisLocked(trsContract, repo));
     }
 
     /**
@@ -405,6 +459,19 @@ public class TrsContractTest {
         assertEquals(BigInteger.ZERO, TRSgetRemainder(trsContract, repo));
     }
 
+    /**
+     * Tests the withdrawTo functionality on a contract with numerous depositors such that each
+     * depositor makes multiple withdraw requests during every period of the contract right into its
+     * final period.
+     *
+     * We expect that none of the extra withdrawal attempts will affect the results and that after
+     * all of the withdrawals each account will receive back the original X coins it had deposited
+     * into the contract plus potentially some bonus funds.
+     *
+     * We check that each account does in fact recieve this amount at least and that the contract's
+     * remaining funds are within the expected bounds and that the contract has sufficient funds to
+     * pay out all accounts.
+     */
     @Test
     public void testWithdrawalsOverFullContractLifetimeWithExtraDeposits() {
         BigInteger bonusDeposits = BigInteger.valueOf(RandomUtils.nextInt(1_000, 100_000));
@@ -728,6 +795,573 @@ public class TrsContractTest {
         assertEquals(balance, repo.getBalance(account));
     }
 
+    /**
+     * Tests calling bulkWithdraw in the final period of a TRS contract and checks that each address
+     * receives all of the original funds it deposited back and that the contract has zero funds
+     * remaining after the withdrawal.
+     *
+     * Also verifies that subsequent withdrawals do not interfere with the results.
+     */
+    @Test
+    public void testBulkWithdrawalInFinalPeriod() {
+        BigInteger bonusDeposits = BigInteger.ZERO;
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(4, 60);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawal using periods value: " + periods);
+        System.out.println("testBulkWithdrawal using t0special value: " + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // After this call we know all accounts have deposited all their funds into trsContract.
+        ObjectHolder holder = setupTRScontractWithDeposits(repo, periods, t0special, numDepositors,
+            bonusDeposits);
+        Address trsContract = (Address) holder.grabObjectAtPosition(0);
+        List<Address> accounts = (List<Address>) holder.grabObjectAtPosition(1);
+        List<BigInteger> balances = (List<BigInteger>) holder.grabObjectAtPosition(2);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        assertEquals(totalFunds, TRSgetRemainder(trsContract, repo));
+
+        // Move into the final period of the contract and make the bulk withdrawal.
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        long startTime = TRSgetStartTime(trsContract, repo);
+        addBlock(startTime + (periods * periodInterval));
+
+        // We make 2 calls to ensure the second doesn't interfere with the first.
+        NRG = Constants.NRG_TRANSACTION_MAX;
+        TRSbulkWithdrawal(trsContract, repo, accounts);
+        TRSbulkWithdrawal(trsContract, repo, accounts);
+
+        BigInteger sum = BigInteger.ZERO;
+        int i = 0;
+        for (Address account : accounts) {
+            BigInteger balance = repo.getBalance(account);
+            sum = sum.add(balance);
+            assertEquals(balances.get(i), balance);
+            i++;
+        }
+
+        assertEquals(totalFunds, sum);
+        assertEquals(BigInteger.ZERO, TRSgetRemainder(trsContract, repo));
+    }
+
+    /**
+     * Tests calling bulkWithdraw in the final period of a TRS contract that has some bonus funds in
+     * it and checks that each address receives at least all of the original funds (receives the
+     * expected amount) it deposited back.
+     *
+     * Also verifies that subsequent withdrawals do not interfere with the results, and that the
+     * remaining funds in the contract are less than the number of accounts in the contract.
+     */
+    @Test
+    public void testBulkWithdrawalInFinalPeriodWithExtraFunds() {
+        BigInteger bonusDeposits = BigInteger.valueOf(RandomUtils.nextInt(1_000, 100_000));
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(4, 60);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalInFinalPeriodWithExtraFunds using bonusDeposits: "
+            + bonusDeposits);
+        System.out.println("testBulkWithdrawalInFinalPeriodWithExtraFunds using periods value: "
+            + periods);
+        System.out.println("testBulkWithdrawalInFinalPeriodWithExtraFunds using t0special value: "
+            + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // After this call we know all accounts have deposited all their funds into trsContract.
+        ObjectHolder holder = setupTRScontractWithDeposits(repo, periods, t0special, numDepositors,
+            bonusDeposits);
+        Address trsContract = (Address) holder.grabObjectAtPosition(0);
+        List<Address> accounts = (List<Address>) holder.grabObjectAtPosition(1);
+        List<BigInteger> balances = (List<BigInteger>) holder.grabObjectAtPosition(2);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        assertEquals(totalFunds, TRSgetRemainder(trsContract, repo));
+
+        // Move into the final period of the contract and make the bulk withdrawal.
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        long startTime = TRSgetStartTime(trsContract, repo);
+        addBlock(startTime + (periods * periodInterval));
+
+        NRG = Constants.NRG_TRANSACTION_MAX;
+        TRSbulkWithdrawal(trsContract, repo, accounts);
+
+        BigInteger sum = BigInteger.ZERO;
+        int i = 0;
+        for (Address account : accounts) {
+            BigInteger balance = repo.getBalance(account);
+            sum = sum.add(balance);
+            assertTrue(balances.get(i).compareTo(balance) <= 0);
+            i++;
+        }
+
+        // Check that the contract has enough funds in it to make all of the withdrawals and that
+        // the contract has the appropriate remainder.
+        BigInteger remainder = TRSgetRemainder(trsContract, repo);
+        assertTrue(sum.compareTo(totalFunds) <= 0);
+        assertEquals(totalFunds.subtract(sum), remainder);
+
+        // I believe that the remainder should be strictly less than the number of depositors in
+        // all cases... I may be wrong here...
+        assertTrue(remainder.compareTo(BigInteger.valueOf(numDepositors)) < 0);
+    }
+
+    /**
+     * Tests the bulkWithdraw functionality on a contract with numerous depositors such that multiple
+     * bulk withdrawal requests are made during every period of the contract right into its final
+     * period.
+     *
+     * We expect that none of the extra withdrawal attempts will affect the results and that after
+     * all of the withdrawals each account will receive back the original X coins it had deposited
+     * into the contract.
+     *
+     * We check that each account does in fact recieve this amount and that the contract has zero
+     * remaining funds in it and that the contract had sufficient funds in the first place to pay
+     * out all accounts.
+     */
+    @Test
+    public void testBulkWithdrawalOverContractLifetime() {
+        BigInteger bonusDeposits = BigInteger.ZERO;
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(4, 60);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalOverContractLifetime using periods value: "
+            + periods);
+        System.out.println("testBulkWithdrawalOverContractLifetime using t0special value: "
+            + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // After this call we know all accounts have deposited all their funds into trsContract.
+        ObjectHolder holder = setupTRScontractWithDeposits(repo, periods, t0special, numDepositors,
+            bonusDeposits);
+        Address trsContract = (Address) holder.grabObjectAtPosition(0);
+        List<Address> accounts = (List<Address>) holder.grabObjectAtPosition(1);
+        List<BigInteger> balances = (List<BigInteger>) holder.grabObjectAtPosition(2);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        assertEquals(totalFunds, TRSgetRemainder(trsContract, repo));
+
+        // Verify each account has correct balance in contract and that contract has correct sum.
+        verifyAccountsInContract(trsContract, repo, accounts, balances, bonusDeposits);
+        assertAllAccountsHaveZeroBalance(repo, accounts);
+
+        // Move through each period and make excessive withdrawals in each.
+        NRG = Constants.NRG_TRANSACTION_MAX;
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        makeExcessBulkWithdrawalsInAllPeriods(trsContract, repo, periods, periodInterval, accounts);
+
+        // Check that each account has withdrawn its original deposits and that the contract has
+        // no remainder left.
+        int i = 0;
+        for (Address account : accounts) {
+            assertEquals(balances.get(i), repo.getBalance(account));
+            i++;
+        }
+        assertEquals(BigInteger.ZERO, TRSgetRemainder(trsContract, repo));
+    }
+
+    /**
+     * Tests the bulkWithdraw functionality on a contract with numerous depositors such that multiple
+     * bulk withdrawal requests are made during every period of the contract right into its final
+     * period.
+     *
+     * We expect that none of the extra withdrawal attempts will affect the results and that after
+     * all of the withdrawals each account will receive back the original X coins it had deposited
+     * into the contract plus potentially some bonus funds.
+     *
+     * We check that each account does in fact recieve this amount at least and that the contract's
+     * remaining funds are within the expected bounds and that the contract has sufficient funds to
+     * pay out all accounts.
+     */
+    @Test
+    public void testBulkWithdrawalOverContractLifetimeWithExtraFunds() {
+        BigInteger bonusDeposits = BigInteger.valueOf(RandomUtils.nextInt(1_000, 100_000));
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(4, 60);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalOverContractLifetimeWithExtraFunds using bonusDeposits: "
+            + bonusDeposits);
+        System.out.println("testBulkWithdrawalOverContractLifetimeWithExtraFunds using periods value: "
+            + periods);
+        System.out.println("testBulkWithdrawalOverContractLifetimeWithExtraFunds using t0special value: "
+            + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // After this call we know all accounts have deposited all their funds into trsContract.
+        ObjectHolder holder = setupTRScontractWithDeposits(repo, periods, t0special, numDepositors,
+            bonusDeposits);
+        Address trsContract = (Address) holder.grabObjectAtPosition(0);
+        List<Address> accounts = (List<Address>) holder.grabObjectAtPosition(1);
+        List<BigInteger> balances = (List<BigInteger>) holder.grabObjectAtPosition(2);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        assertEquals(totalFunds, TRSgetRemainder(trsContract, repo));
+
+        // Verify each account has correct balance in contract and that contract has correct sum.
+        verifyAccountsInContract(trsContract, repo, accounts, balances, bonusDeposits);
+        assertAllAccountsHaveZeroBalance(repo, accounts);
+
+        // Move through each period and make excessive withdrawals in each.
+        NRG = Constants.NRG_TRANSACTION_MAX;
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        makeExcessBulkWithdrawalsInAllPeriods(trsContract, repo, periods, periodInterval, accounts);
+
+        // Check that each account has withdrawn its original deposits at least.
+        BigInteger sum = BigInteger.ZERO;
+        int i = 0;
+        for (Address account : accounts) {
+            BigInteger balance = repo.getBalance(account);
+            sum = sum.add(balance);
+            assertTrue(balances.get(i).compareTo(balance) <= 0);
+            i++;
+        }
+
+        // Check that the contract has enough funds in it to make all of the withdrawals and that
+        // the contract has the appropriate remainder.
+        BigInteger remainder = TRSgetRemainder(trsContract, repo);
+        assertTrue(sum.compareTo(totalFunds) <= 0);
+        assertEquals(totalFunds.subtract(sum), remainder);
+
+        // I believe that the remainder should be strictly less than the number of depositors in
+        // all cases... I may be wrong here...
+        assertTrue(remainder.compareTo(BigInteger.valueOf(numDepositors)) < 0);
+    }
+
+    /**
+     * Tests that a call to bulkWithdraw during each period of the contract allows the caller to
+     * withdraw the appropriate fraction of funds they are entitled to.
+     *
+     * Since this call actually withdraws the amount as well, we use periods * L accounts such that
+     * if we break these up into L lists of size periods, the i'th account in all of the L lists
+     * have the deposited the same amount. We can think of there being L copies of each of the
+     * periods number of distinct accounts.
+     *
+     * Now we perform a bulk withdraw on each of the L lists periods time, once per period, so that
+     * we can capture the amount that the i'th account is able to withdraw in each of the periods
+     * independent of the prior withdrawals.
+     */
+    @Test
+    public void testBulkWithdrawalPerEachPeriod() {
+        BigInteger bonusDeposits = BigInteger.ZERO;
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(1, 100);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalPerEachPeriod using periods value: " + periods);
+        System.out.println("testBulkWithdrawalPerEachPeriod using t0special value: " + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // we set: L = numDepositors    (see documentation above if this makes no sense.)
+        List<List<Address>> accounts = new ArrayList<>(periods);
+        List<BigInteger> balances = getRandomBalances(numDepositors);
+        for (int i = 0; i < periods; i++) {
+            accounts.add(makeAccounts(repo, balances));
+        }
+
+        // Set up the contract with all of the deposits; give each account extra balance to ensure
+        // they can cover the tx costs.
+        List<Address> allAccounts = flatten(accounts);
+        List<BigInteger> allBalances = replicate(balances, periods);
+        assertEquals(numDepositors * periods, allAccounts.size());
+        assertEquals(allAccounts.size(), allBalances.size());
+        giveBalanceTo(repo, allAccounts, DEFAULT_BALANCE);
+        Address trsContract = TRSdepositAndMakeLive(repo, periods, t0special, allAccounts,
+            allBalances, bonusDeposits);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        assertEquals(totalFunds, TRSgetRemainder(trsContract, repo));
+
+        // We move through each period of the contract and verify the withdrawal amount each time.
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        long periodStartTime = TRSgetStartTime(trsContract, repo);
+        for (int i = 1; i <= periods; i++) {
+            // Grab account and give it some balance for the transaction cost.
+            List<Address> accountsThisRound = accounts.get(i - 1);
+            giveAllAccountsBalance(repo, accountsThisRound, DEFAULT_BALANCE);
+
+            List<BigInteger> expectedWithdraw = computeExpectedWithdrawalsAtPeriod(trsContract, repo,
+                accountsThisRound, t0special, i, periods);
+
+            NRG = Constants.NRG_TRANSACTION_MAX;
+            wipeAllBalances(repo, accountsThisRound);
+            TRSbulkWithdrawal(trsContract, repo, accountsThisRound);
+            List<BigInteger> withdrawals = getBalancesOf(repo, accountsThisRound);
+            assertEquals(expectedWithdraw, withdrawals);
+
+            // move to next period.
+            periodStartTime += periodInterval;
+            addBlock(periodStartTime);
+        }
+    }
+
+    /**
+     * Tests that a call to bulkWithdraw during each period of the contract allows the caller to
+     * withdraw the appropriate fraction of funds they are entitled to when the contract has
+     * bonus deposits in it.
+     *
+     * Since this call actually withdraws the amount as well, we use periods * L accounts such that
+     * if we break these up into L lists of size periods, the i'th account in all of the L lists
+     * have the deposited the same amount. We can think of there being L copies of each of the
+     * periods number of distinct accounts.
+     *
+     * Now we perform a bulk withdraw on each of the L lists periods time, once per period, so that
+     * we can capture the amount that the i'th account is able to withdraw in each of the periods
+     * independent of the prior withdrawals.
+     */
+    @Test
+    public void testBulkWithdrawalPerEachPeriodWithExtraDeposits() {
+        BigInteger bonusDeposits = BigInteger.valueOf(RandomUtils.nextInt(1_000, 100_000));
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(1, 100);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalPerEachPeriodWithExtraDeposits using bonusDeposits: "
+            + bonusDeposits);
+        System.out.println("testBulkWithdrawalPerEachPeriodWithExtraDeposits using periods value: "
+            + periods);
+        System.out.println("testBulkWithdrawalPerEachPeriodWithExtraDeposits using t0special value: "
+            + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // we set: L = numDepositors    (see documentation above if this makes no sense.)
+        List<List<Address>> accounts = new ArrayList<>(periods);
+        List<BigInteger> balances = getRandomBalances(numDepositors);
+        for (int i = 0; i < periods; i++) {
+            accounts.add(makeAccounts(repo, balances));
+        }
+
+        // Set up the contract with all of the deposits; give each account extra balance to ensure
+        // they can cover the tx costs.
+        List<Address> allAccounts = flatten(accounts);
+        List<BigInteger> allBalances = replicate(balances, periods);
+        assertEquals(numDepositors * periods, allAccounts.size());
+        assertEquals(allAccounts.size(), allBalances.size());
+        giveBalanceTo(repo, allAccounts, DEFAULT_BALANCE);
+        Address trsContract = TRSdepositAndMakeLive(repo, periods, t0special, allAccounts,
+            allBalances, bonusDeposits);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        assertEquals(totalFunds, TRSgetRemainder(trsContract, repo));
+
+        // We move through each period of the contract and verify the withdrawal amount each time.
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        long periodStartTime = TRSgetStartTime(trsContract, repo);
+        for (int i = 1; i <= periods; i++) {
+            // Grab account and give it some balance for the transaction cost.
+            List<Address> accountsThisRound = accounts.get(i - 1);
+            giveAllAccountsBalance(repo, accountsThisRound, DEFAULT_BALANCE);
+
+            List<BigInteger> expectedWithdraw = computeExpectedWithdrawalsAtPeriod(trsContract, repo,
+                accountsThisRound, t0special, i, periods);
+
+            NRG = Constants.NRG_TRANSACTION_MAX;
+            wipeAllBalances(repo, accountsThisRound);
+            TRSbulkWithdrawal(trsContract, repo, accountsThisRound);
+            List<BigInteger> withdrawals = getBalancesOf(repo, accountsThisRound);
+            assertEquals(expectedWithdraw, withdrawals);
+
+            // move to next period.
+            periodStartTime += periodInterval;
+            addBlock(periodStartTime);
+        }
+    }
+
+    /**
+     * Returns true iff addresses1 and addresses2 are disjoint lists.
+     */
+    private static boolean listsAreDisjoint(List<Address> addresses1, List<Address> addresses2) {
+        boolean areDisjoint = true;
+        for (Address address : addresses1) {
+            if (addresses2.contains(address)) {
+                areDisjoint = false;
+            }
+        }
+        for (Address address : addresses2) {
+            if (addresses1.contains(address)) {
+                areDisjoint = false;
+            }
+        }
+        return areDisjoint;
+    }
+
+    /**
+     * Returns a list with all addresses in addresses1 and addresses2 in a random ordering.
+     *
+     * @param addresses1 The first list of addresses.
+     * @param addresses2 The second list of addresses.
+     * @return the merged and shuffled lists.
+     */
+    private static List<Address> mergeAddresses(List<Address> addresses1, List<Address> addresses2) {
+        List<Address> mergedAddresses = new ArrayList<>(addresses1);
+        mergedAddresses.addAll(addresses2);
+        Collections.shuffle(mergedAddresses);
+        return mergedAddresses;
+    }
+
+    /**
+     * Tests that when bulkWithdraw is called on a group of addresses that contains depositors and
+     * non-depositors that only the depositors are able to withdraw funds from the contract and that
+     * nothing is withdrawn by the non-depositors.
+     */
+    @Test
+    public void testBulkWithdrawalSomeLegitSomeNotLegitAddresses() {
+        BigInteger bonusDeposits = BigInteger.valueOf(RandomUtils.nextInt(1_000, 100_000));
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(1, 100);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalSomeLegitSomeNotLegitAddresses using bonusDeposits: "
+            + bonusDeposits);
+        System.out.println("testBulkWithdrawalSomeLegitSomeNotLegitAddresses using periods value: "
+            + periods);
+        System.out.println("testBulkWithdrawalSomeLegitSomeNotLegitAddresses using t0special value: "
+            + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // Put together the depositors and invalids. Only depositors will make deposits, but both
+        // parties will be part of the bulk withdrawal.
+        List<BigInteger> depositorBalances = getRandomBalances(numDepositors / 2);
+        List<Address> depositors = makeAccounts(repo, depositorBalances);
+        List<BigInteger> invalidBalances = getRandomBalances(numDepositors / 2);
+        List<Address> invalids = makeAccounts(repo, invalidBalances);
+        while (!listsAreDisjoint(depositors, invalids)) {
+            depositors = makeAccounts(repo, depositorBalances);
+            invalids = makeAccounts(repo, invalidBalances);
+        }
+
+        // We know our depositors and invalids are disjoint now.. create the contract and have all
+        // depositors make their deposits.
+        giveBalanceTo(repo, depositors, DEFAULT_BALANCE);
+        Address trsContract = TRSdepositAndMakeLive(repo, periods, t0special, depositors,
+            depositorBalances, bonusDeposits);
+
+        // Move into an arbitrary period.. we don't care which one.
+        long startTime = TRSgetStartTime(trsContract, repo);
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        int newPeriod = RandomUtils.nextInt(1, periods + 1);
+        addBlock(startTime + (newPeriod * periodInterval));
+
+        // Perform the bulk withdrawal and check that the invalids received nothing and that the
+        // legit accounts received something.
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+        List<Address> allAddresses = mergeAddresses(depositors, invalids);
+        wipeAllBalances(repo, allAddresses);
+        TRSbulkWithdrawal(trsContract, repo, allAddresses);
+
+        BigInteger sum = BigInteger.ZERO;
+        for (Address address : allAddresses) {
+            if (depositors.contains(address)) {
+                BigInteger withdraw = repo.getBalance(address);
+                sum = sum.add(withdraw);
+                assertTrue(withdraw.compareTo(BigInteger.ZERO) > 0);
+            } else {
+                assertTrue(invalids.contains(address));
+                assertEquals(BigInteger.ZERO, repo.getBalance(address));
+            }
+        }
+
+        // Ensure contract did not give out more funds than it could and that the remaining funds
+        // in the contract is the expected value.
+        assertTrue(sum.compareTo(totalFunds) <= 0);
+        assertEquals(totalFunds.subtract(sum), TRSgetRemainder(trsContract, repo));
+    }
+
+    /**
+     * Tests bulkWithdraw on a list of accounts, all of which are the same account, and ensures that
+     * only one withdrawal was carried out as expected and that the contract has the expected value
+     * remaining.
+     */
+    @Test
+    public void testBulkWithdrawalOnSameAddress() {
+        BigInteger bonusDeposits = BigInteger.valueOf(RandomUtils.nextInt(1_000, 100_000));
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(1, 100);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalOnSameAddress using bonusDeposits: " + bonusDeposits);
+        System.out.println("testBulkWithdrawalOnSameAddress using periods value: " + periods);
+        System.out.println("testBulkWithdrawalOnSameAddress using t0special value: " + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // Produce the same account copied numDepositors times.
+        BigInteger balance = getRandomBalances(1).get(0);
+        Address account = makeAccount(repo, balance);
+        List<BigInteger> balances = getFixedBalances(numDepositors, balance);
+        List<Address> addresses = replicateAddress(account, numDepositors);
+        assertEquals(numDepositors, addresses.size());
+        assertEquals(addresses.size(), balances.size());
+
+
+        // We have our single account make its deposit.
+        giveBalanceTo(repo, Collections.singletonList(account), DEFAULT_BALANCE);
+        Address trsContract = TRSdepositAndMakeLive(repo, periods, t0special,
+            Collections.singletonList(account), Collections.singletonList(balance), bonusDeposits);
+
+        // Move into an arbitrary period.. we don't care which one.
+        long startTime = TRSgetStartTime(trsContract, repo);
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        int newPeriod = RandomUtils.nextInt(1, periods + 1);
+        addBlock(startTime + (newPeriod * periodInterval));
+
+        // Perform the bulk withdrawal and check that only one withdrawal occurred.
+        int currentPeriod = TRSgetCurrentPeriod(trsContract, repo);
+        BigInteger expectedWithdraw = computeExpectedWithdrawalAtPeriod(trsContract, repo, account,
+            t0special, currentPeriod, periods);
+        BigInteger totalFunds = TRSgetTotalFunds(trsContract, repo);
+
+        wipeBalance(repo, account);
+        TRSbulkWithdrawal(trsContract, repo, addresses);
+        assertEquals(expectedWithdraw, repo.getBalance(account));
+        assertTrue(expectedWithdraw.compareTo(totalFunds) <= 0);
+        assertEquals(totalFunds.subtract(expectedWithdraw), TRSgetRemainder(trsContract, repo));
+    }
+
+    /**
+     * Tests calling bulkWithdraw before the contract goes live. In this case the call should not
+     * be successful and no state changes should occur.
+     */
+    @Test
+    public void testBulkWithdrawalBeforeLive() {
+        int numDepositors = 25;
+        int periods = RandomUtils.nextInt(1, 100);
+        int t0special = RandomUtils.nextInt(0, 100);
+        System.out.println("testBulkWithdrawalBeforeLive using periods value: " + periods);
+        System.out.println("testBulkWithdrawalBeforeLive using t0special value: " + t0special);
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+
+        // Create the contract, don't lock or make it live yet.
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+
+        // Attempt to do a bulk withdrawal.
+        List<BigInteger> balances = getRandomBalances(numDepositors);
+        List<Address> accounts = makeAccounts(repo, balances);
+        wipeAllBalances(repo, accounts);
+        TRSbulkWithdrawalWillFail(trsContract, repo, accounts);
+
+        // Now lock the contract and try again... should be the same result.
+        lockTRScontract(trsContract, repo);
+        TRSbulkWithdrawalWillFail(trsContract, repo, accounts);
+
+        assertAllAccountsHaveZeroBalance(repo, accounts);
+        assertEquals(BigInteger.ZERO, TRSgetTotalFunds(trsContract, repo));
+        assertEquals(BigInteger.ZERO, TRSgetRemainder(trsContract, repo));
+    }
+
+    @Test
+    public void testBulkDeposit() {
+        //TODO
+    }
+
+    @Test
+    public void testUpdateTotalSideEffects() {
+        //TODO
+    }
+
+    @Test
+    public void testNullify() {
+        //TODO
+    }
+
+    @Test
+    public void testTransferOwnership() {
+        //TODO
+    }
+
+    @Test
+    public void testMultiMint() {
+        //TODO
+    }
+
     //<----------------------------------------HELPERS--------------------------------------------->
 
     /**
@@ -754,17 +1388,29 @@ public class TrsContractTest {
     }
 
     /**
-     * Returns fraction divided by precision to 18 decimal places.
-     */
-    private BigDecimal undoPrecision(BigInteger fraction, BigInteger precision) {
-        return new BigDecimal(fraction).divide(new BigDecimal(precision), 18, RoundingMode.DOWN);
-    }
-
-    /**
      * Returns fraction * precision.
      */
     private BigInteger correctToPrecision(BigDecimal fraction, BigInteger precision) {
         return fraction.multiply(new BigDecimal(precision)).toBigInteger();
+    }
+
+    /**
+     * Returns a list of the amount of coins each account in accounts is expected to be eligible to
+     * withdraw in period currentPEriod for a TRS contract at address trsContract that has a
+     * t0special value of t0special and has periods number of periods.
+     *
+     * The returned list is such that the i'th account in accounts is expected to be eligible to
+     * withdraw the i'th amount in the returned list.
+     */
+    private List<BigInteger> computeExpectedWithdrawalsAtPeriod(Address trsContract,
+        IRepositoryCache repo, List<Address> accounts, int t0special, int currentPeriod, int periods) {
+
+        List<BigInteger> withdrawals = new ArrayList<>(accounts.size());
+        for (Address account : accounts) {
+            withdrawals.add(computeExpectedWithdrawalAtPeriod(trsContract, repo, account, t0special,
+                currentPeriod, periods));
+        }
+        return withdrawals;
     }
 
     /**
@@ -838,6 +1484,66 @@ public class TrsContractTest {
     }
 
     /**
+     * Makes a bulk withdrawal call on the TRS contract at address trsContract for all of the accounts
+     * in beneficiaries. This method directly calls the bulkWithdraw function in the contract. The
+     * behaviour of this function is equivalent to calling withdrawTo for each of the accounts in
+     * beneficiaries.
+     *
+     * This method fails if the size of beneficiaries is larger than 25 since we start getting into
+     * OUT_OF_NRG territory here.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param beneficiaries The accounts to attempt to withdraw funds to.
+     */
+    private void TRSbulkWithdrawal(Address trsContract, IRepositoryCache repo, List<Address> beneficiaries) {
+        assertTrue(beneficiaries.size() <= 25);
+        byte[] input = makeBulkWithdrawInput(beneficiaries);
+        ExecutionResult result = makeContractCall(trsContract, repo, deployer, input);
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+    }
+
+    /**
+     * Attempts to make a bulk withdrawal call on the TRS contract at address trsContract for all of
+     * the accounts in beneficiaries and expects the call to not be successful. If the call is
+     * successful this method will cause the calling test case to fail.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param beneficiaries The withdrawal beneficiaries.
+     */
+    private void TRSbulkWithdrawalWillFail(Address trsContract, IRepositoryCache repo,
+        List<Address> beneficiaries) {
+
+        assertTrue(beneficiaries.size() <= 25);
+        byte[] input = makeBulkWithdrawInput(beneficiaries);
+        ExecutionResult result = makeContractCall(trsContract, repo, deployer, input);
+        assertNotEquals(ResultCode.SUCCESS, result.getResultCode());
+    }
+
+    /**
+     * Returns the input byte array to the bulkWithdraw function under the assumption that addresses
+     * is the list of withdrawal beneficiaries given to the function.
+     */
+    private byte[] makeBulkWithdrawInput(List<Address> addresses) {
+        byte[] offset = new DataWord(16).getData();
+        SolidityType type = new DynamicArrayType("address[]");
+        byte[] params = ByteUtil.merge(offset, type.encode(toStrings(addresses)));
+        return ByteUtil.merge(Hex.decode("2ed94f6c"), params);
+    }
+
+    /**
+     * Converts the list of addresses to a list of String representations of the addresses.
+     */
+    private static List<String> toStrings(List<Address> addresses) {
+        List<String> stringAddresses = new ArrayList<>();
+        for (Address address : addresses) {
+            stringAddresses.add(address.toString());
+        }
+        return stringAddresses;
+    }
+
+    /**
      * Returns the amount of funds account is eligible to withdraw from the TRS contract at address
      * trsContract at time time.
      *
@@ -887,25 +1593,6 @@ public class TrsContractTest {
     private boolean TRSwithdrawFundsFor(Address trsContract, IRepositoryCache repo, Address beneficiary) {
         byte[] input = ByteUtil.merge(Hex.decode("72b0d90c"), beneficiary.toBytes());
         ExecutionResult result = makeContractCall(trsContract, repo, deployer, input);
-        assertEquals(ResultCode.SUCCESS, result.getResultCode());
-        byte[] output = result.getOutput();
-        return output[output.length - 1] == 0x1;
-    }
-
-    /**
-     * Makes an attempt to withdraw coins from the TRS contract at address trsContract for the
-     * account withdrawer and returns true iff a positive amount of coins was successfully withdrawn.
-     *
-     * Note: the withdrawal here is performed by withdrawer itself.
-     *
-     * @param trsContract Address of deployed TRS contract.
-     * @param repo The repo.
-     * @param withdrawer The account attempting to withdraw funds.
-     * @return true iff a positive amount of funds was withdrawn.
-     */
-    private boolean TRSwithdrawFunds(Address trsContract, IRepositoryCache repo, Address withdrawer) {
-        byte[] input = Hex.decode("3ccfd60b");
-        ExecutionResult result = makeContractCall(trsContract, repo, withdrawer, input);
         assertEquals(ResultCode.SUCCESS, result.getResultCode());
         byte[] output = result.getOutput();
         return output[output.length - 1] == 0x1;
@@ -1016,6 +1703,33 @@ public class TrsContractTest {
     }
 
     /**
+     * This method will deploy a new TRS contract and will deposit the i'th balance in balances into
+     * the contract for the i'th account in accounts and will ensure that none of the accounts in
+     * accounts have any balance remaining after this call returns. The contract will then be locked
+     * and bonusDeposits amount of coins will be deposited into the contract as a bonus, then the
+     * contract will be made live.
+     *
+     * This method returns the address of the newly deployed TRS contract.
+     */
+    private Address TRSdepositAndMakeLive(IRepositoryCache repo, int periods, int t0special,
+        List<Address> accounts, List<BigInteger> balances, BigInteger bonusDeposits) {
+
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, periods, t0special);
+        depositIntoTRScontract(trsContract, repo, accounts, balances);
+        BigInteger expectedFacevalue = sumOf(balances);
+        assertEquals(expectedFacevalue, TRSgetTotalFacevalue(trsContract, repo));
+        lockTRScontract(trsContract, repo);
+        repo.addBalance(trsContract, bonusDeposits);
+        startTRScontract(trsContract, repo);
+        assertTrue(TRSisLocked(trsContract, repo));
+        assertTrue(TRSisStarted(trsContract, repo));
+        wipeAllBalances(repo, accounts);
+        assertAllAccountsHaveZeroBalance(repo, accounts);
+        return trsContract;
+    }
+
+    /**
      * This method will deploy a new TRS contract and will create numDepositors random accounts,
      * each with a random balance in [1000, 100000000] and will have each such account deposit its
      * full funds into the contract. The contract will then be locked and bonusDeposits amount of
@@ -1033,20 +1747,22 @@ public class TrsContractTest {
 
         ObjectHolder holder = new ObjectHolder();
 
-        Address trsContract = deployTRScontract(repo);
-        initTRScontract(trsContract, repo, periods, t0special);
+//        Address trsContract = deployTRScontract(repo);
+//        initTRScontract(trsContract, repo, periods, t0special);
         List<BigInteger> balances = getRandomBalances(numDepositors);
         List<Address> accounts = makeAccounts(repo, DEFAULT_BALANCE, balances.size());
-        depositIntoTRScontract(trsContract, repo, accounts, balances);
-        BigInteger expectedFacevalue = sumOf(balances);
-        assertEquals(expectedFacevalue, TRSgetTotalFacevalue(trsContract, repo));
-        lockTRScontract(trsContract, repo);
-        repo.addBalance(trsContract, bonusDeposits);
-        startTRScontract(trsContract, repo);
-        assertTrue(TRSisLocked(trsContract, repo));
-        assertTrue(TRSisStarted(trsContract, repo));
-        wipeAllBalances(repo, accounts);
-        assertAllAccountsHaveZeroBalance(repo, accounts);
+//        depositIntoTRScontract(trsContract, repo, accounts, balances);
+//        BigInteger expectedFacevalue = sumOf(balances);
+//        assertEquals(expectedFacevalue, TRSgetTotalFacevalue(trsContract, repo));
+//        lockTRScontract(trsContract, repo);
+//        repo.addBalance(trsContract, bonusDeposits);
+//        startTRScontract(trsContract, repo);
+//        assertTrue(TRSisLocked(trsContract, repo));
+//        assertTrue(TRSisStarted(trsContract, repo));
+//        wipeAllBalances(repo, accounts);
+//        assertAllAccountsHaveZeroBalance(repo, accounts);
+        Address trsContract = TRSdepositAndMakeLive(repo, periods, t0special, accounts, balances,
+            bonusDeposits);
 
         holder.placeObject(trsContract);
         holder.placeObject(accounts);
@@ -1222,6 +1938,65 @@ public class TrsContractTest {
     }
 
     /**
+     * Attempts to use the account caller to accept an ownership proposal for the contract at address
+     * trsContract so that if this call succeeds caller will be the new owner of the contract.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param caller The could-be new owner.
+     */
+    private void TRSacceptOwnership(Address trsContract, IRepositoryCache repo, Address caller) {
+        byte[] input = Hex.decode("79ba5097");
+        ExecutionResult result = makeContractCall(trsContract, repo, caller, input);
+        if (result.getResultCode().equals(ResultCode.SUCCESS)) {
+            System.err.println(caller + " has accepted ownership of the TRS contract!");
+        }
+    }
+
+    /**
+     * Proposes a new owner for the TRS contract at address trsContract to be newOwner. After this
+     * call newOwner is not yet the owner, newOwner must formally accept the ownership offer through
+     * the contract in order to be the real owner of the contract and usurp the current owner.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param newOwner The new owner to propose.
+     */
+    private void TRSproposeNewOwner(Address trsContract, IRepositoryCache repo, Address newOwner) {
+        byte[] input = ByteUtil.merge(Hex.decode("a6f9dae1"), newOwner.toBytes());
+        ExecutionResult result = makeContractCall(trsContract, repo, deployer, input);
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+    }
+
+    /**
+     * Returns the address of the new owner of the TRS contract at address trsContract.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @return the address of the new contract owner.
+     */
+    private Address TRSwhoIsNewOwner(Address trsContract, IRepositoryCache repo) {
+        byte[] input = Hex.decode("d4ee1d90");
+        ExecutionResult result = makeContractCall(trsContract, repo, deployer, input);
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+        return new Address(result.getOutput());
+    }
+
+    /**
+     * Returns the address of the account that owns the TRS contract at address trsContract.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @return the address of the contract owner.
+     */
+    private Address TRSwhoIsOwner(Address trsContract, IRepositoryCache repo) {
+        byte[] input = Hex.decode("8da5cb5b");
+        ExecutionResult result = makeContractCall(trsContract, repo, deployer, input);
+        assertEquals(ResultCode.SUCCESS, result.getResultCode());
+        return new Address(result.getOutput());
+    }
+
+    /**
      * Starts (or makes live) the TRS contract at address trsContract.
      *
      * @param trsContract Address of deployed TRS contract.
@@ -1236,16 +2011,31 @@ public class TrsContractTest {
     }
 
     /**
+     * Attempts to lock the TRS contract at address trsContract by calling the lock function from
+     * the account caller.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param caller The account that makes the lock attempt.
+     */
+    private void lockTRScontract(Address trsContract, IRepositoryCache repo, Address caller) {
+        byte[] input = org.aion.base.util.Hex.decode("f83d08ba");
+        ExecutionResult result = makeContractCall(trsContract, repo, caller, input);
+        if (result.getResultCode().equals(ResultCode.SUCCESS)) {
+            System.err.println("The TRS contract has been locked.");
+        } else {
+            System.err.println("The TRS contract has NOT been locked.");
+        }
+    }
+
+    /**
      * Locks the TRS contract at address trsContract.
      *
      * @param trsContract Address of deployed TRS contract.
      * @param repo The repo.
      */
     private void lockTRScontract(Address trsContract, IRepositoryCache repo) {
-        byte[] input = org.aion.base.util.Hex.decode("f83d08ba");
-        ExecutionResult result = makeContractCall(trsContract, repo, deployer, input);
-        assertEquals(ResultCode.SUCCESS, result.getResultCode());
-        System.err.println("The TRS contract has been locked.");
+        lockTRScontract(trsContract, repo, deployer);
     }
 
     /**
@@ -1450,6 +2240,22 @@ public class TrsContractTest {
     }
 
     /**
+     * Returns a list of |initBalances| new random accounts such that the i'th account in the
+     * returned list has a balance equal to the i'th balance in initBalances.
+     *
+     * @param repo The repo.
+     * @param initBalances The initial balances of the accounts.
+     * @return a list of |initBalances| new accounts.
+     */
+    private List<Address> makeAccounts(IRepositoryCache repo, List<BigInteger> initBalances) {
+        List<Address> accounts = new ArrayList<>(initBalances.size());
+        for (BigInteger balance : initBalances) {
+            accounts.add(makeAccount(repo, balance));
+        }
+        return accounts;
+    }
+
+    /**
      * Returns a list of numAccounts new random accounts, each of which is saved in repo with an
      * initial balance corresponding to the balance listed in initBalances.
      *
@@ -1543,6 +2349,28 @@ public class TrsContractTest {
     }
 
     /**
+     * Makes multiple bulkWithdraw requests for each account in accounts into the TRS contract at
+     * address trsContract over all of the periods that have a duration of periodInterval seconds.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param repo The repo.
+     * @param periods The number of periods in the contract.
+     * @param periodInterval The duration (in seconds) of each period.
+     * @param accounts The accounts in the contract.
+     */
+    private void makeExcessBulkWithdrawalsInAllPeriods(Address trsContract, IRepositoryCache repo,
+        int periods, int periodInterval, List<Address> accounts) {
+
+        for (int i = 0; i < periods; i++) {
+            for (int j = 0; j < periodInterval; j++) {
+                // We make withdrawal attempts each second right into the final period.
+                TRSbulkWithdrawal(trsContract, repo, accounts);
+                addBlock(blockchain.getBestBlock().getTimestamp() + 1);
+            }
+        }
+    }
+
+    /**
      * Makes multiple withdrawal requests for each account in accounts into the TRS contract at
      * address trsContract over all of the periods that have a duration of periodInterval seconds.
      *
@@ -1563,6 +2391,97 @@ public class TrsContractTest {
                 }
                 addBlock(blockchain.getBestBlock().getTimestamp() + 1);
             }
+        }
+    }
+
+    /**
+     * Returns a 'flattened' version of addresses by replacing each list of addresses with the
+     * addresses it holds. If addresses is to be traversed from list to list in order then this same
+     * ordering is preserved by the returned flattened list.
+     *
+     * @param addresses The nested list to flatten.
+     * @return the flattened list.
+     */
+    private static List<Address> flatten(List<List<Address>> addresses) {
+        List<Address> flatList = new ArrayList<>();
+        for (List<Address> list : addresses) {
+            flatList.addAll(list);
+        }
+        return flatList;
+    }
+
+    /**
+     * Returns a new list that is of length |nums| * replications and consists of the list nums
+     * followed by replications number of repeats of itself.
+     *
+     * @param nums The list of numbers to replicate.
+     * @param replications The number of replications to make.
+     * @return the replicated list.
+     */
+    private static List<BigInteger> replicate(List<BigInteger> nums, int replications) {
+        List<BigInteger> numbers = new ArrayList<>();
+        for (int i = 0; i < replications; i++) {
+            numbers.addAll(nums);
+        }
+        return numbers;
+    }
+
+    /**
+     * Creates a list of size replications that contains replications copies of the address address.
+     *
+     * @param address The address to copy.
+     * @param replications The number of copies to make.
+     * @return the list of the same address replications times over.
+     */
+    private List<Address> replicateAddress(Address address, int replications) {
+        List<Address> addresses = new ArrayList<>(replications);
+        for (int i = 0; i < replications; i++) {
+            addresses.add(address);
+        }
+        return addresses;
+    }
+
+    /**
+     * Adds balance amount of coins to each account in accounts.
+     *
+     * @param repo The repo.
+     * @param accounts The accounts whose balances are to be increased.
+     * @param balance The amount of balance to increase each account by.
+     */
+    private static void giveBalanceTo(IRepositoryCache repo, List<Address> accounts, BigInteger balance) {
+        for (Address account : accounts) {
+            repo.addBalance(account, balance);
+        }
+    }
+
+    /**
+     * Returns a list of balances of size |accounts| such that the i'th account in accounts has an
+     * account balance equal to the i'th balance in the returned list.
+     *
+     * @param repo The repo.
+     * @param accounts The accounts whose balances are to be retrieved.
+     * @return the balances of the accounts in accounts.
+     */
+    private static List<BigInteger> getBalancesOf(IRepositoryCache repo, List<Address> accounts) {
+        List<BigInteger> balances = new ArrayList<>(accounts.size());
+        for (Address account : accounts) {
+            balances.add(repo.getBalance(account));
+        }
+        return balances;
+    }
+
+    /**
+     * Gives each account in accounts balance more coins.
+     *
+     * @param repo The repo.
+     * @param accounts The accounts whose balance is to be increased.
+     * @param balance The amount of funds to give to each account in accounts.
+     */
+    private static void giveAllAccountsBalance(IRepositoryCache repo, List<Address> accounts,
+        BigInteger balance) {
+
+        for (Address account : accounts) {
+            repo.addBalance(account, DEFAULT_BALANCE);
         }
     }
 
