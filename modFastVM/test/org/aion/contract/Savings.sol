@@ -88,7 +88,7 @@ contract Savings is Owned {
 	uint public t0special;
 
 	uint constant public intervalSecs = 3 seconds;
-	uint constant public precision = 10 ** 7;
+	uint constant public precision = 10 ** 2;
 
 
 	/**
