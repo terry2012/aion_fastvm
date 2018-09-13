@@ -88,7 +88,7 @@ contract Savings is Owned {
 	uint public t0special;
 
 	uint constant public intervalSecs = 3 seconds;
-	uint constant public precision = 10 ** 18;
+	uint constant public precision = 10 ** 7;
 
 
 	/**
@@ -162,7 +162,7 @@ contract Savings is Owned {
 	 */
 	 /**
 	function() {
-		revert();
+		revert();       COMMENTED OUT SO WE CAN HAVE A PAYABLE FUNCTION
 	}
 	*/
 
