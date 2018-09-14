@@ -9,9 +9,7 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import org.aion.base.db.IRepositoryCache;
 import org.aion.base.type.Address;
 import org.aion.base.util.ByteUtil;
@@ -46,16 +44,67 @@ public class TrsContractTest {
     private Address deployer;
     private BigInteger deployerBalance, deployerNonce;
 
-    // These fields correspond to the actual accounts on the ERC-20 side that we are migrating over.
+    //TODO: would greatly appreciate another pair of eyes on these numbers for validations..
+    // NOTE -- if you change the Savings.sol file then update the TRSdeployCode() method with the
+    // correct binary!
+
+    // THIS BLOCK OF FIELDS CORRESPONDS TO THE 4 ADDRESSES IN THE ACTUAL ETHEREUM TRS CONTRACT.
     private static final String ACCOUNT_1 = "b493c9C0C0aBfd9847baB53231774f13BF882eE9";
     private static final String ACCOUNT_2 = "0e24D8Fcdf0c319dF03998Cc53F4FBA035D9a4f9";
     private static final String ACCOUNT_3 = "8567462b8E8303637F0004B2E664993314e58BD7";
     private static final String ACCOUNT_4 = "4778bE92Dd5c51035bf80Fca564ba5E7Fad5FB6d";
-    private static final BigInteger BALANCE_1 = new BigInteger("80453720581476");
-    private static final BigInteger BALANCE_2 = new BigInteger("369329858788742200");
-    private static final BigInteger BALANCE_3 = new BigInteger("19768067000000");
-    private static final BigInteger BALANCE_4 = new BigInteger("108273305929580");
-    private static final BigInteger CONVERSION = BigInteger.TEN.pow(0);
+
+    // THIS BLOCK OF FIELDS CORRESPONDS TO THE ACTUAL ETHEREUM TRS CONTRACT THAT IS DEPLOYED.
+    private static final BigInteger ETH_TOTAL = new BigInteger("30489196119340505");
+    private static final BigInteger ETH_STARTTIME = new BigInteger("1513627200");
+    private static final BigInteger ETH_TOTALFV = new BigInteger("18491381166400396");
+    private static final BigInteger ETH_BONUS = ETH_TOTAL.subtract(ETH_TOTALFV);
+    private static final BigInteger ETH_PERIODS = new BigInteger("36");
+    private static final BigInteger ETH_T0SPECIAL = BigInteger.ZERO;
+    private static final BigInteger ETH_PRECISION = BigInteger.TEN.pow(18);
+    private static final BigInteger DEPOSITED_1 = new BigInteger("3581474393280396");
+    private static final BigInteger DEPOSITED_2 = new BigInteger("9318691733200000");
+    private static final BigInteger DEPOSITED_3 = new BigInteger("2795607519960000");
+    private static final BigInteger DEPOSITED_4 = new BigInteger("2795607519960000");
+    private static final BigInteger WITHDRAWN_1 = new BigInteger("1476313129215250");
+    private static final BigInteger WITHDRAWN_2 = new BigInteger("3841241187887422");
+    private static final BigInteger WITHDRAWN_3 = new BigInteger("1152372356366226");
+    private static final BigInteger WITHDRAWN_4 = new BigInteger("1152372356366226");
+
+    // THIS BLOCK OF FIELDS ARE THE AMOUNTS EACH ACCOUNT WILL HAVE WITHDRAWN ON ETHEREUM SIDE IN PERIOD 12.
+    private static final BigInteger LAST_WITHDRAW_PERIOD = new BigInteger("12");
+    private static final BigInteger LAST_WITHDRAW_1 = new BigInteger("1968417505620333");
+    private static final BigInteger LAST_WITHDRAW_2 = new BigInteger("5121654917183230");
+    private static final BigInteger LAST_WITHDRAW_3 = new BigInteger("1536496475154969");
+    private static final BigInteger LAST_WITHDRAW_4 = new BigInteger("1536496475154969");
+
+    // THIS BLOCK OF FIELDS CORRESPONDS TO OUR AION TRS CONTRACT, AFTER ETHEREUM HAS BEEN MIGRATED OVER.
+    private static final BigInteger AION_TOTAL = new BigInteger("20326130746227004");
+    private static final BigInteger AION_STARTTIME = new BigInteger("0");
+    private static final BigInteger AION_TOTALFV = new BigInteger("8328315793286895");
+    private static final BigInteger AION_PERIODS = new BigInteger("24");
+    private static final BigInteger AION_T0SPECIAL = BigInteger.ZERO;
+    private static final BigInteger AION_DEPOSITED_1 = new BigInteger("1613056887660063");
+    private static final BigInteger AION_DEPOSITED_2 = new BigInteger("4197036816016770");
+    private static final BigInteger AION_DEPOSITED_3 = new BigInteger("1259111044805031");
+    private static final BigInteger AION_DEPOSITED_4 = new BigInteger("1259111044805031");
+
+    // AION_CONVERSION = x specifies the exponent (ie. 10^x) by which to augment the ethereum figures.
+    private static BigInteger AION_CONVERSION = BigInteger.ONE;
+    /**
+     * Sets the number of left shifts to perform on the ethereum token amounts when converting them
+     * over to Aion coins.
+     *
+     * The actual difference between these amounts is 10^10, but this number causes overflow in the
+     * contract.
+     *
+     * The solution is to reduce this conversion down to 10^x for some x < 10 and then in the
+     * contract, once the withdrawable amount is computed, to multiply it by 10^y such that x+y=10
+     * so that the 10^10 conversion does in fact take place.
+     */
+    private void setAionConversion(int conversion) {
+        AION_CONVERSION = BigInteger.valueOf(conversion);
+    }
 
     @Before
     public void setup() {
@@ -78,9 +127,6 @@ public class TrsContractTest {
         deployerBalance = null;
         deployerNonce = null;
     }
-
-    // NOTE -- if you change the Savings.sol file then update the TRSdeployCode() method with the
-    // correct binary!
 
     /**
      * Tests we can query the start time of the contract.
@@ -1320,48 +1366,100 @@ public class TrsContractTest {
      */
     @Test
     public void testCheckAccountsDeposits() {
-        int periods = 24;
-        int t0special = 0;
         IRepositoryCache repo = blockchain.getRepository().startTracking();
+        Address trsContract = setupAionContract(repo);
 
-        Address trsContract = deployTRScontract(repo);
-        initTRScontract(trsContract, repo, periods, t0special);
-        addBlock(blockchain.getBestBlock().getTimestamp());
-
-        List<Address> accounts = getRealAccounts();
-        List<BigInteger> balances = getRealBalances();
-        setupAccounts(repo, accounts, balances);
-
-        depositIntoTRScontract(trsContract, repo, accounts, balances);
+        // Check each account has its expected deposit amount in the contract.
+        List<Address> accounts = grabETHaccounts();
+        List<BigInteger> balances = grabAionTRSdeposits();
         checkTRSdeposits(trsContract, repo, accounts, balances);
 
-        lockTRScontract(trsContract, repo);
-        startTRScontract(trsContract, repo);
-        BigInteger total = sumOf(balances);
-        assertEquals(total, TRSgetTotalFunds(trsContract, repo));
-        assertEquals(total, TRSgetRemainder(trsContract, repo));
+        // Check the contract total, facevalue and remainder.
+        assertEquals(grabAionTotal(), TRSgetTotalFunds(trsContract, repo));
+        assertEquals(grabAionTotalFacevalue(), TRSgetTotalFacevalue(trsContract, repo));
+        assertEquals(grabAionTotal(), TRSgetRemainder(trsContract, repo));
+    }
+
+    /**
+     * This is not a test -- this method generates a useful report.
+     *
+     * This report prints out the exact amount of funds the accounts withdraw in each period of the
+     * contract as well as the total amounts each account withdraws over the full contract lifetime
+     * and the amount of funds remaining in the contract once all withdrawal periods end.
+     * This report also displays the number of periods in which ZERO coins were withdrawn (we don't
+     * want this sort of behaviour).
+     *
+     * This method is used to compare the results of the various conversion/precision trade-offs we
+     * can make.
+     */
+    @Test
+    public void testGenerateAionContractReport() {
+        IRepositoryCache repo = blockchain.getRepository().startTracking();
+        Address trsContract = setupAionContract(repo);
+
+        // Ensure none of the accounts have any balance so later calculations are correct.
+        List<Address> accounts = grabETHaccounts();
+        wipeAllBalances(repo, accounts);
+        assertAllAccountsHaveZeroBalance(repo, accounts);
+
+        // Make withdrawals each period.
+        int periods = grabAionTRSperiods();
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        long time = TRSgetStartTime(trsContract, repo);
+
+        // We only need to track one account for this value since this occurs when fraction = 0 and
+        // the same fraction is used in every period.
+        BigInteger numZeroWithdrawals = BigInteger.ZERO;
+        for (int i = 1; i <= periods; i++) {
+            List<BigInteger> balancesBeforeWithdrawal = getCurrentBalances(repo, accounts);
+            TRSbulkWithdrawal(trsContract, repo, accounts);
+            List<BigInteger> balancesAfterWithdrawal = getCurrentBalances(repo, accounts);
+
+            List<BigInteger> withdraws = getDifferences(balancesBeforeWithdrawal, balancesAfterWithdrawal);
+            if (withdraws.get(0).equals(BigInteger.ZERO))
+                numZeroWithdrawals = numZeroWithdrawals.add(BigInteger.ONE);
+            System.err.println("Period #" + i + " withdrawals: " + withdraws);
+            addBlock(time += periodInterval);
+        }
+
+        System.err.println("Number of zero withdrawal periods: " + numZeroWithdrawals);
+        System.err.println("Account balances at end of contract: " + getCurrentBalances(repo, accounts));
+        System.err.println("Remainder at end of contract: " + TRSgetRemainder(trsContract, repo));
     }
 
     /**
      * Tests that the 4 ERC-20 accounts can call withdraw during everyone of the periods and in
      * none of them does an integer overflow occur.
      *
-     * Note: the constant CONVERSION should be modified for this test as well. CONVERSION is the
-     * number we will multiply the ERC-20 funds by when bringing them over to Aion.
-     * The actual difference between the two is 10^10 but this is not a possible goal for us.
+     * I have personally verified the following conversion/precision amounts to work by hand and by
+     * using this method:
+     *      1. conversion = 10^0    precision = 10^6
+     *      2. conversion = 10^1    precision = 10^4
+     *      3. conversion = 10^2    precision = 10^2
+     *
+     * These are tight bounds in the sense that, for each conversion of the form 10^x, its
+     * corresponding precision as listed above as 10^y will cause overflow if the precision is set
+     * to 10^(y+1).
+     *
+     * We cannot increase conversion higher than 10^2 otherwise precision gets so poor that the
+     * contract behaviour becomes nonsensical.
      */
     @Test
     public void testOverflow() {
-        List<Address> accounts = getRealAccounts();
-        List<BigInteger> deposits = getRealBalances();
+        // The precision & conversion values to play with.
+        BigInteger precision = BigInteger.TEN.pow(6);
+        setAionConversion(0);
+
+        // Grab the accounts and their deposits adjusted accordingly as specified above.
+        List<Address> accounts = grabETHaccounts();
+        List<BigInteger> deposits = grabAionTRSdeposits();
         assertEquals(4, accounts.size());
         assertEquals(accounts.size(), deposits.size());
 
-        int t0special = 0;
-        int periods = 24;
-        BigInteger precision = BigInteger.TEN.pow(2);
-        BigInteger total = sumOf(deposits);
-        BigInteger totalfv = total;     // ie. no bonus deposits.
+        int periods = grabAionTRSperiods();
+        int t0special = grabAionTRSt0special();
+        BigInteger total = grabAionTotal();
+        BigInteger totalfv = grabAionTotalFacevalue();
 
         // Test each account over each period.
         for (int accountIndex = 0; accountIndex < 4; accountIndex++) {
@@ -1373,241 +1471,178 @@ public class TrsContractTest {
     }
 
     /**
-     * Tests that the 4 ERC-20 accounts when migrated over with their balances to the contract here
-     * can perform multiple withdrawals in every period that the TRS contract is live and that each
-     * account withdraws its expected amount in the end and the TRS has enough funds to pay them
-     * with and its remainder is as expected.
-     *
-     * Note: this test fails when all accounts DO NOT receive back their FULL ORIGINAL deposits into
-     * the contract. This failure does not necessarily mean the contract is broken or an overflow
-     * occurred. Rounding errors can produce this as well.
+     * Verify that the data I pulled from the ethereum TRS contract was representative of the contract
+     * in period 9.
      */
     @Test
-    public void testWithdrawalsOverContractLifetime() {
-        int periods = 24;
-        int t0special = 0;
+    public void testVerifyEthereumTRSinPeriod9() {
         IRepositoryCache repo = blockchain.getRepository().startTracking();
-
         Address trsContract = deployTRScontract(repo);
-        initTRScontract(trsContract, repo, periods, t0special);
+        initTRScontract(trsContract, repo, ETH_PERIODS.intValueExact(), ETH_T0SPECIAL.intValueExact());
+        addBlock(ETH_STARTTIME.longValueExact());
 
-        List<Address> accounts = getRealAccounts();
-        List<BigInteger> balances = getRealBalances();
+        // Set up the accounts.
+        List<Address> accounts = grabETHaccounts();
+        List<BigInteger> balances = grabETHdeposits();
+        List<BigInteger> withdrawals = grabETHwithdrawals();
         setupAccounts(repo, accounts, balances);
 
+        // Make the deposits and start the contract.
         depositIntoTRScontract(trsContract, repo, accounts, balances);
-        checkTRSdeposits(trsContract, repo, accounts, balances);
         lockTRScontract(trsContract, repo);
+        repo.addBalance(trsContract, ETH_BONUS);
         startTRScontract(trsContract, repo);
-        BigInteger total = sumOf(balances);
-        assertEquals(total, TRSgetTotalFunds(trsContract, repo));
+        BigInteger contractTotal = TRSgetTotalFunds(trsContract, repo);
+        BigInteger contractTotalFV = TRSgetTotalFacevalue(trsContract, repo);
+        BigInteger contractBonus = contractTotal.subtract(contractTotalFV);
 
-        wipeAllBalances(repo, accounts);
-        assertAllAccountsHaveZeroBalance(repo, accounts);
+        // Check the deployed contract's state against the ERC-20 contract state.
+        assertEquals(ETH_TOTAL, contractTotal);
+        assertEquals(ETH_TOTALFV, contractTotalFV);
+        assertEquals(ETH_BONUS, contractBonus);
+        assertEquals(ETH_PERIODS.intValueExact(), TRSgetNumPeriods(trsContract, repo));
+        assertEquals(ETH_STARTTIME.longValueExact(), TRSgetStartTime(trsContract, repo));
 
-        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
-        makeExcessWithdrawalsInAllPeriods(trsContract, repo, periods, periodInterval, accounts);
-
-        assertEquals(BigInteger.ZERO, TRSgetRemainder(trsContract, repo));
-        int i = 0;
-        for (Address account : accounts) {
-            assertEquals(balances.get(i), repo.getBalance(account));
-            i++;
-        }
+        // Verify the ethereum contract is in period 9.
+        assertEquals(withdrawals, grabETHwithdrawalsAtPeriod(trsContract, repo, 9));
     }
 
     /**
-     * This is not a test -- this method generates a useful report.
+     * Shows that our period 12 withdrawal data is as expected. This is so that we can be sure that
+     * our hard-coded values correspond to the correct values in the contract during period 12 of
+     * the ethereum TRS contract.
      *
-     * This method simply runs the TRS contract and in each period sees how much balance each account
-     * is able to withdraw and compares this actual withdrawal amount to the amount they would
-     * withdraw with the original 10^18 precision enabled. For each account it reports which period
-     * produces the largest difference and what that difference is.
-     *
-     * Most useful aspects of the report:
-     *      1. The exact amounts each account withdrew during each round.
-     *      2. The amount of coins each account has failed to reclaim after contract lifetime.
+     * We are going to use these values as our starting point. From period 12 there are 24 periods
+     * remaining. The Aion TRS contract will therefore be a 24 period contract whose starting values
+     * will be derived from the state of the ethereum contract in its 12'th period.
      */
     @Test
-    public void testReportGreatestRoundOffErrors() {
-        int periods = 24;
-        int t0special = 0;
+    public void testVerifyOurInitialAmountsCorrespondToPeriod12inEthereumContract() {
         IRepositoryCache repo = blockchain.getRepository().startTracking();
-
         Address trsContract = deployTRScontract(repo);
-        initTRScontract(trsContract, repo, periods, t0special);
-        addBlock(blockchain.getBestBlock().getTimestamp());
+        initTRScontract(trsContract, repo, ETH_PERIODS.intValueExact(), ETH_T0SPECIAL.intValueExact());
+        addBlock(ETH_STARTTIME.longValueExact());
 
-        List<Address> accounts = getRealAccounts();
-        List<BigInteger> balances = getRealBalances();
+        // Set up the accounts.
+        List<Address> accounts = grabETHaccounts();
+        List<BigInteger> balances = grabETHdeposits();
+        List<BigInteger> withdrawals = grabETHwithdrawals();
         setupAccounts(repo, accounts, balances);
 
+        // Make the deposits and start the contract.
         depositIntoTRScontract(trsContract, repo, accounts, balances);
-        checkTRSdeposits(trsContract, repo, accounts, balances);
         lockTRScontract(trsContract, repo);
+        repo.addBalance(trsContract, ETH_BONUS);
         startTRScontract(trsContract, repo);
-        BigInteger total = sumOf(balances);
-        assertEquals(total, TRSgetTotalFunds(trsContract, repo));
+        BigInteger contractTotal = TRSgetTotalFunds(trsContract, repo);
+        BigInteger contractTotalFV = TRSgetTotalFacevalue(trsContract, repo);
+        BigInteger contractBonus = contractTotal.subtract(contractTotalFV);
 
-        wipeAllBalances(repo, accounts);
-        assertAllAccountsHaveZeroBalance(repo, accounts);
+        // Check the deployed contract's state against the ERC-20 contract state.
+        assertEquals(ETH_TOTAL, contractTotal);
+        assertEquals(ETH_TOTALFV, contractTotalFV);
+        assertEquals(ETH_BONUS, contractBonus);
+        assertEquals(ETH_PERIODS.intValueExact(), TRSgetNumPeriods(trsContract, repo));
+        assertEquals(ETH_STARTTIME.longValueExact(), TRSgetStartTime(trsContract, repo));
 
-        List<Map<BigInteger, Integer>> stats = initMaps(accounts.size());
-        List<BigInteger> zeroWithdrawCounters = initCounters(accounts.size());
-        List<List<BigInteger>> withdrawHistory = new ArrayList<>();
-
-        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
-        long time = TRSgetStartTime(trsContract, repo);
-        for (int i = 1; i <= periods; i++) {
-            addBlock(time + ((i - 1) * periodInterval));
-            List<BigInteger> currentBalances = getCurrentBalances(repo, accounts);
-
-            for (Address account : accounts) {
-                TRSwithdrawFundsFor(trsContract, repo, account);
-            }
-
-            List<BigInteger> newBalances = getCurrentBalances(repo, accounts);
-            List<BigInteger> diffs = getDifferences(currentBalances, newBalances);
-            withdrawHistory.add(diffs);
-            List<BigInteger> roundOffs = computeRoundOffErrors(
-                diffs, trsContract, repo, accounts, t0special, i, periods);
-            updateMap(stats, roundOffs, i);
-            updateCounters(zeroWithdrawCounters, diffs);
-        }
-
-        List<BigInteger> totalDiffs = getDifferences(getCurrentBalances(repo, accounts), getRealBalances());
-        List<BigInteger> largestDiffs = getLargestKeys(stats);
-        List<Integer> diffPeriods = getValues(stats, largestDiffs);
-        printRoundOffReport(largestDiffs, diffPeriods, zeroWithdrawCounters, withdrawHistory, totalDiffs);
-
-        BigInteger outstanding = sumOf(totalDiffs);
-        assertEquals(outstanding, TRSgetRemainder(trsContract, repo));
+        // Grab the amount of coins each account will have withdrawn by the time the Aion TRS goes
+        // live...
+        assertEquals(grabHardCodedETHwithdrawalsAtPeriod12(),
+            grabETHwithdrawalsAtPeriod(trsContract, repo, LAST_WITHDRAW_PERIOD.intValueExact()));
     }
 
-    private List<BigInteger> computeRoundOffErrors(List<BigInteger> withdrawals, Address trsContract,
-        IRepositoryCache repo, List<Address> accounts, int t0special, int currentPeriod, int periods) {
+    /**
+     * Proofs by Java for tight bounds on key numbers.
+     */
+    @Test
+    public void testBoundProofs() {
+        assertTrue(shiftLeft(AION_DEPOSITED_1, 2).compareTo(BigInteger.TWO.pow(57)) >= 0);
+        assertTrue(shiftLeft(AION_DEPOSITED_1, 2).compareTo(BigInteger.TWO.pow(58)) < 0);
 
-        assertEquals(withdrawals.size(), accounts.size());
-        int size = accounts.size();
-        List<BigInteger> roundOffs = new ArrayList<>(size);
-        for (int i = 0; i < size; i++) {
-            roundOffs.add(computeRoundOffError(withdrawals.get(i), trsContract, repo,
-                accounts.get(i), t0special, currentPeriod, periods));
-        }
-        return roundOffs;
+        assertTrue(shiftLeft(AION_DEPOSITED_2, 2).compareTo(BigInteger.TWO.pow(58)) >= 0);
+        assertTrue(shiftLeft(AION_DEPOSITED_2, 2).compareTo(BigInteger.TWO.pow(59)) < 0);
+
+        assertTrue(shiftLeft(AION_DEPOSITED_3, 2).compareTo(BigInteger.TWO.pow(56)) >= 0);
+        assertTrue(shiftLeft(AION_DEPOSITED_3, 2).compareTo(BigInteger.TWO.pow(57)) < 0);
+
+        assertTrue(shiftLeft(AION_DEPOSITED_4, 2).compareTo(BigInteger.TWO.pow(56)) >= 0);
+        assertTrue(shiftLeft(AION_DEPOSITED_4, 2).compareTo(BigInteger.TWO.pow(57)) < 0);
+
+        assertTrue(shiftLeft(AION_TOTAL, 2).compareTo(BigInteger.TWO.pow(60)) >= 0);
+        assertTrue(shiftLeft(AION_TOTAL, 2).compareTo(BigInteger.TWO.pow(61)) < 0);
+
+        assertTrue(shiftLeft(AION_TOTALFV, 2).compareTo(BigInteger.TWO.pow(59)) >= 0);
+        assertTrue(shiftLeft(AION_TOTALFV, 2).compareTo(BigInteger.TWO.pow(60)) < 0);
+
+        assertTrue(BigInteger.TEN.pow(6).compareTo(BigInteger.TWO.pow(19)) >= 0);
+        assertTrue(BigInteger.TEN.pow(6).compareTo(BigInteger.TWO.pow(21)) < 0);
+
+        assertTrue(BigInteger.TEN.pow(10).compareTo(BigInteger.TWO.pow(33)) >= 0);
+        assertTrue(BigInteger.TEN.pow(10).compareTo(BigInteger.TWO.pow(34)) < 0);
     }
 
-    private BigInteger computeRoundOffError(BigInteger withdrew, Address trsContract,
-        IRepositoryCache repo, Address account, int t0special, int currentPeriod, int periods) {
+    /**
+     * Essentially derives the Aion figures from the hard-coded period 12 expected withdrawal amounts
+     * since another test case checks the validity of these numbers, and checks our hard-coded Aion
+     * values against these figures.
+     */
+    @Test
+    public void testVerifyAionInitialFigures() {
+        for (int i = 0; i < 3; i++) {
+            setAionConversion(i);
 
-        BigInteger expected = computeExpectedWithdrawalAtPeriod(
-            trsContract, repo, account, t0special, currentPeriod, periods, BigInteger.TEN.pow(18));
-        return expected.subtract(withdrew);
-    }
+            List<BigInteger> amountsClaimed = bulkShiftLeft(grabHardCodedETHwithdrawalsAtPeriod12(),
+                AION_CONVERSION.intValueExact());
 
-    private void updateCounters(List<BigInteger> counters, List<BigInteger> differences) {
-        assertEquals(counters.size(), differences.size());
-        int size = counters.size();
-        for (int i = 0; i < size; i++) {
-            if (differences.get(i).compareTo(BigInteger.ZERO) == 0) {
-                BigInteger oldCount = counters.remove(i);
-                counters.add(i, oldCount.add(BigInteger.ONE));
-                assertTrue(counters.get(i).compareTo(oldCount.add(BigInteger.ONE)) == 0);
-            }
-        }
-    }
+            // amountsUnclaimed will be the amounts each account will initial deposit into the Aion TRS.
+            List<BigInteger> aionDeposits = grabAionTRSdeposits();
+            List<BigInteger> amountsUnclaimed = getDifferences(amountsClaimed, bulkShiftLeft(grabETHdeposits(),
+                AION_CONVERSION.intValueExact()));
+            assertEquals(aionDeposits, amountsUnclaimed);
+            assertEquals(grabAionTotalFacevalue(), sumOf(aionDeposits));
+            System.err.println(aionDeposits);
 
-    private List<BigInteger> initCounters(int num) {
-        List<BigInteger> counters = new ArrayList<>(num);
-        for (int i = 0; i < num; i++) {
-            counters.add(BigInteger.ZERO);
-        }
-        return counters;
-    }
+            // check that the total funds left in ethereum contract in period 12 is equal to the total
+            // funds put into the Aion contract.
+            BigInteger ethereumTotalInPeriod12 = shiftLeft(ETH_TOTAL, AION_CONVERSION.intValueExact())
+                .subtract(sumOf(amountsClaimed));
+            assertEquals(ethereumTotalInPeriod12, grabAionTotal());
 
-    private void printRoundOffReport(List<BigInteger> diffs, List<Integer> periods,
-        List<BigInteger> zeroCounts, List<List<BigInteger>> withdrawHistory,
-        List<BigInteger> totalDiffs) {
-
-        assertEquals(diffs.size(), periods.size());
-        int size = diffs.size();
-        for (int i = 0; i < size; i++) {
-            System.err.println("Period # " + periods.get(i) + " had a round-off error of: " + diffs.get(i));
-            System.err.println(i + "'th account had " + zeroCounts.get(i) + " zero withdrawals.");
+            assertEquals(BigInteger.ZERO.intValueExact(), grabAionTRSt0special());
+            assertEquals(ETH_PERIODS.subtract(LAST_WITHDRAW_PERIOD).intValueExact(),
+                grabAionTRSperiods());
         }
-        int i = 1;
-        for (List<BigInteger> withdraws : withdrawHistory) {
-            System.err.println("Accounts withdrew during period " + i++ + " --> these amounts --> " + withdraws);
-        }
-        i = 0;
-        for (BigInteger diff : totalDiffs) {
-            System.err.println("Account " + i++ + " is missing " + diff + " coins from original deposit!");
-        }
-    }
-
-    private List<Integer> getValues(List<Map<BigInteger, Integer>> maps, List<BigInteger> keys) {
-        assertEquals(maps.size(), keys.size());
-        List<Integer> values = new ArrayList<>(maps.size());
-        int size = maps.size();
-        for (int i = 0; i < size; i++) {
-            values.add(maps.get(i).get(keys.get(i)));
-        }
-        return values;
-    }
-
-    private List<BigInteger> getLargestKeys(List<Map<BigInteger, Integer>> maps) {
-        List<BigInteger> keys = new ArrayList<>(maps.size());
-        for (Map<BigInteger, Integer> map : maps) {
-            keys.add(getLargestKey(map));
-        }
-        return keys;
-    }
-
-    private BigInteger getLargestKey(Map<BigInteger, Integer> map) {
-        BigInteger largest = BigInteger.ONE.negate();
-        for (BigInteger key : map.keySet()) {
-            if (key.compareTo(largest) > 0) {
-                largest = key;
-            }
-        }
-        return largest;
-    }
-
-    private void updateMap(List<Map<BigInteger, Integer>> map, List<BigInteger> diffs, int period) {
-        assertEquals(map.size(), diffs.size());
-        int size = map.size();
-        for (int i = 0; i < size; i++) {
-            map.get(i).put(diffs.get(i), period);
-        }
-    }
-
-    private List<BigInteger> getDifferences(List<BigInteger> oldBalances, List<BigInteger> newBalances) {
-        assertEquals(oldBalances.size(), newBalances.size());
-        List<BigInteger> diffs = new ArrayList<>();
-        int size = oldBalances.size();
-        for (int i = 0; i < size; i++) {
-            diffs.add(newBalances.get(i).subtract(oldBalances.get(i)));
-        }
-        return diffs;
-    }
-
-    private List<BigInteger> getCurrentBalances(IRepositoryCache repo, List<Address> accounts) {
-        List<BigInteger> balances = new ArrayList<>();
-        for (Address account : accounts) {
-            balances.add(repo.getBalance(account));
-        }
-        return balances;
-    }
-
-    private List<Map<BigInteger, Integer>> initMaps(int numMaps) {
-        List<Map<BigInteger, Integer>> list = new ArrayList<>();
-        for (int i = 0; i < numMaps; i++) {
-            list.add(new HashMap<>());
-        }
-        return list;
     }
 
     //<----------------------------------------HELPERS--------------------------------------------->
+
+    /**
+     * Deploys a new Aion TRS contract that uses the accounts migrated over from the ethereum TRS.
+     * This method also deposits the appropriate amounts per each account into the contract and
+     * locks the contract, deposits the appropriate bonus amount, and starts the contract.
+     *
+     * Returns the address of the deployed TRS contract.
+     */
+    private Address setupAionContract(IRepositoryCache repo) {
+        Address trsContract = deployTRScontract(repo);
+        initTRScontract(trsContract, repo, AION_PERIODS.intValueExact(), AION_T0SPECIAL.intValueExact());
+        addBlock(AION_STARTTIME.longValueExact());
+
+        // Set up the Aion accounts with the appropriate balances.
+        List<Address> accounts = grabETHaccounts();
+        List<BigInteger> balances = grabAionTRSdeposits();
+        BigInteger bonus = grabAionTotal().subtract(grabAionTotalFacevalue());
+        setupAccounts(repo, accounts, balances);
+
+        // Deposit the balances.
+        depositIntoTRScontract(trsContract, repo, accounts, balances);
+
+        // Deposit the bonus funds, lock and start the contract.
+        lockTRScontract(trsContract, repo);
+        repo.addBalance(trsContract, bonus);
+        startTRScontract(trsContract, repo);
+        return trsContract;
+    }
 
     /**
      * Checks that each account in accounts exists in the TRS contract at address trsContract and
@@ -1670,18 +1705,14 @@ public class TrsContractTest {
         BigInteger precision = TRSgetPrecision(trsContract, repo);
         return computeExpectedWithdrawalAtPeriod(
             trsContract, repo, account, t0special, currentPeriod, periods, precision);
-
-//        BigInteger deposit = TRSgetAccountDeposited(trsContract, repo, account);
-//        BigInteger total = TRSgetTotalFunds(trsContract, repo);
-//        BigInteger totalfv = TRSgetTotalFacevalue(trsContract, repo);
-//        BigInteger precision = TRSgetPrecision(trsContract, repo);
-//        BigInteger fraction = fraction(t0special, currentPeriod, periods, precision);
-//
-//        BigInteger numerator = deposit.multiply(total).multiply(fraction);
-//        BigInteger quotient = numerator.divide(totalfv);
-//        return quotient.divide(precision);
     }
 
+    /**
+     * Returns the amount of coins account is expected to be eligible to withdraw in period
+     * currentPeriod for a TRS contract at address trsContract that has a t0special value of
+     * t0special and has periods number of periods and has a precision value of precision.
+     *
+     */
     private BigInteger computeExpectedWithdrawalAtPeriod(Address trsContract, IRepositoryCache repo,
         Address account, int t0special, int currentPeriod, int periods, BigInteger precision) {
 
@@ -2747,12 +2778,6 @@ public class TrsContractTest {
         return new Address(padded);
     }
 
-    /**
-     * Converts an ethereum balance to an Aion balance by correcting for the change of base values.
-     */
-    private static BigInteger toAionBalance(BigInteger ethereumBalance) {
-        return ethereumBalance.multiply(CONVERSION);
-    }
 
     /**
      * Returns true iff addresses1 and addresses2 are disjoint lists.
@@ -2784,33 +2809,6 @@ public class TrsContractTest {
         mergedAddresses.addAll(addresses2);
         Collections.shuffle(mergedAddresses);
         return mergedAddresses;
-    }
-
-    /**
-     * Returns a list of the 4 real ERC-20 accounts for the contract. Since ERC-20 accounts are 20
-     * bytes long and Aion are 32 bytes, each account has 12 zero bytes appended to its ending.
-     * The returned list returns accounts 1,2,3,4 in this order.
-     */
-    private static List<Address> getRealAccounts() {
-        List<Address> accounts = new ArrayList<>(4);
-        accounts.add(toPaddedAddress(ACCOUNT_1));
-        accounts.add(toPaddedAddress(ACCOUNT_2));
-        accounts.add(toPaddedAddress(ACCOUNT_3));
-        accounts.add(toPaddedAddress(ACCOUNT_4));
-        return accounts;
-    }
-
-    /**
-     * Returns a list of the 4 balances corresponding to the 4 real ERC-20 accounts for the contract.
-     * The returned list returns balances 1,2,3,4 in this order.
-     */
-    private static List<BigInteger> getRealBalances() {
-        List<BigInteger> balances = new ArrayList<>(4);
-        balances.add(toAionBalance(BALANCE_1));
-        balances.add(toAionBalance(BALANCE_2));
-        balances.add(toAionBalance(BALANCE_3));
-        balances.add(toAionBalance(BALANCE_4));
-        return balances;
     }
 
     /**
@@ -2859,6 +2857,7 @@ public class TrsContractTest {
     private void checkOverflow(int t0special, int currentPeriod, int periods, BigInteger precision,
         BigInteger deposit, BigInteger total, BigInteger totalfv) {
 
+        System.err.println("Checking period #" + currentPeriod + " Deposit amount: " + deposit + " Totalfv: " + totalfv);
         BigInteger threshold = BigInteger.TWO.pow(128);
         BigInteger special = BigInteger.valueOf(t0special);
         BigInteger currPeriod = BigInteger.valueOf(currentPeriod);
@@ -2887,6 +2886,208 @@ public class TrsContractTest {
         assertTrue(step5.compareTo(threshold) < 0);
         BigInteger step6 = step5.divide(precision);
         assertTrue(step6.compareTo(threshold) < 0);
+
+        // Check that multiplying the end result by 10^10 still does not overflow.
+        BigInteger result = step6.multiply(BigInteger.TEN.pow(10));
+        assertTrue(result.compareTo(threshold) < 0);
+    }
+
+    /**
+     * Returns a list such that the i'th value in the returned list is equal to the i'th value in
+     * newBalances minus the i'th value in oldBalances.
+     */
+    private List<BigInteger> getDifferences(List<BigInteger> oldBalances, List<BigInteger> newBalances) {
+        assertEquals(oldBalances.size(), newBalances.size());
+        List<BigInteger> diffs = new ArrayList<>();
+        int size = oldBalances.size();
+        for (int i = 0; i < size; i++) {
+            diffs.add(newBalances.get(i).subtract(oldBalances.get(i)));
+        }
+        return diffs;
+    }
+
+    /**
+     * Returns a list of balances such that the i'th balance in the returned list is the balance
+     * of the i'th account in accounts.
+     */
+    private List<BigInteger> getCurrentBalances(IRepositoryCache repo, List<Address> accounts) {
+        List<BigInteger> balances = new ArrayList<>();
+        for (Address account : accounts) {
+            balances.add(repo.getBalance(account));
+        }
+        return balances;
+    }
+
+    /**
+     * Returns the initial amounts each of the 4 accounts in the TRS contract will transfer over
+     * into the Aion TRS contract.
+     *
+     * The AION_CONVERSION value affects these results!
+     */
+    private static List<BigInteger> grabAionTRSdeposits() {
+        List<BigInteger> deposits = new ArrayList<>(4);
+        deposits.add(shiftLeft(AION_DEPOSITED_1, AION_CONVERSION.intValueExact()));
+        deposits.add(shiftLeft(AION_DEPOSITED_2, AION_CONVERSION.intValueExact()));
+        deposits.add(shiftLeft(AION_DEPOSITED_3, AION_CONVERSION.intValueExact()));
+        deposits.add(shiftLeft(AION_DEPOSITED_4, AION_CONVERSION.intValueExact()));
+        return deposits;
+    }
+
+    /**
+     * Returns the t0special amount for the Aion contract.
+     */
+    private static int grabAionTRSt0special() {
+        return AION_T0SPECIAL.intValueExact();
+    }
+
+    /**
+     * Returns the number of periods in the Aion contract.
+     */
+    private static int grabAionTRSperiods() {
+        return AION_PERIODS.intValueExact();
+    }
+
+    /**
+     * Returns the sum of deposits in the Aion contract.
+     *
+     * The AION_CONVERSION value affects these results!
+     */
+    private static BigInteger grabAionTotalFacevalue() {
+        return shiftLeft(AION_TOTALFV, AION_CONVERSION.intValueExact());
+    }
+
+    /**
+     * Returns the total amount of funds in the Aion contract.
+     *
+     * The AION_CONVERSION value affects these results!
+     */
+    private static BigInteger grabAionTotal() {
+        return shiftLeft(AION_TOTAL, AION_CONVERSION.intValueExact());
+    }
+
+    /**
+     * Returns all the addresses in the ethereum TRS contract.
+     *
+     * Always returns these addresses in the exact same order.
+     */
+    private static List<Address> grabETHaccounts() {
+        List<Address> accounts = new ArrayList<>(4);
+        accounts.add(toPaddedAddress(ACCOUNT_1));
+        accounts.add(toPaddedAddress(ACCOUNT_2));
+        accounts.add(toPaddedAddress(ACCOUNT_3));
+        accounts.add(toPaddedAddress(ACCOUNT_4));
+        return accounts;
+    }
+
+    /**
+     * Grabs the deposits made by the accounts in the ethereum TRS contract.
+     *
+     * NO inflation/conversion is made to these deposit amounts, they are taken straight from the
+     * ethereum TRS side and are not adjusted.
+     *
+     * The returned order is such that, given the list of accounts produced by grabETHaccounts(),
+     * the i'th account in that list has deposited an amount equal to the i'th amount in this
+     * return list.
+     */
+    private static List<BigInteger> grabETHdeposits() {
+        List<BigInteger> deposits = new ArrayList<>();
+        deposits.add(DEPOSITED_1);
+        deposits.add(DEPOSITED_2);
+        deposits.add(DEPOSITED_3);
+        deposits.add(DEPOSITED_4);
+        return deposits;
+    }
+
+    /**
+     * Grabs the amounts the accounts in the ethereum TRS contract have currently withdrawn.
+     *
+     * NO inflation/conversion is made to these withdrawal amounts, they are taken straight from the
+     * ethereum TRS side and are not adjusted.
+     *
+     * The returned order is such that, given the list of accounts produced by grabETHaccounts(),
+     * the i'th account in that list has withdrawn an amount equal to the i'th amount in this
+     * return list.
+     */
+    private static List<BigInteger> grabETHwithdrawals() {
+        List<BigInteger> withdrawals = new ArrayList<>();
+        withdrawals.add(WITHDRAWN_1);
+        withdrawals.add(WITHDRAWN_2);
+        withdrawals.add(WITHDRAWN_3);
+        withdrawals.add(WITHDRAWN_4);
+        return withdrawals;
+    }
+
+    /**
+     * Returns the hard-coded amounts that each account has withdrawn in period 12 on the ethereum
+     * side.
+     *
+     * Returns them in the order account 1,2,3,4 every time.
+     */
+    private static List<BigInteger> grabHardCodedETHwithdrawalsAtPeriod12() {
+        List<BigInteger> withdrawals = new ArrayList<>();
+        withdrawals.add(LAST_WITHDRAW_1);
+        withdrawals.add(LAST_WITHDRAW_2);
+        withdrawals.add(LAST_WITHDRAW_3);
+        withdrawals.add(LAST_WITHDRAW_4);
+        return withdrawals;
+    }
+
+    /**
+     * Returns a list of the amounts each of the accounts in the ethereum TRS contract will have
+     * withdrawn (or be eligible to withdraw) in period number period.
+     *
+     * NO adjustments are made to these numbers!
+     *
+     * The returned order is such that, given the list of accounts produced by grabETHaccounts(),
+     * the i'th account in that list will be eligible to withdraw an amount equal to the i'th amount
+     * in this return list.
+     *
+     * @param trsContract Address of deployed TRS contract.
+     * @param  repo The repo.
+     * @param period The period to query.
+     */
+    private List<BigInteger> grabETHwithdrawalsAtPeriod(Address trsContract, IRepositoryCache repo, int period) {
+        List<Address> ERCaccounts = grabETHaccounts();
+        List<BigInteger> withdrawals = new ArrayList<>();
+        for (Address account : ERCaccounts) {
+            withdrawals.add(computeExpectedWithdrawalAtPeriod(
+                trsContract, repo, account, ETH_T0SPECIAL.intValueExact(), period,
+                ETH_PERIODS.intValueExact(), ETH_PRECISION));
+        }
+        return withdrawals;
+    }
+
+    /**
+     * Returns each number in numbers with numShifts zeros in its least significant digits.
+     */
+    private static List<BigInteger> bulkShiftLeft(List<BigInteger> numbers, int numShifts) {
+        List<BigInteger> nums = new ArrayList<>();
+        for (BigInteger num : numbers) {
+            nums.add(shiftLeft(num, numShifts));
+        }
+        return nums;
+    }
+
+    /**
+     * Returns number with numShifts zeros in its least significant digits.
+     */
+    private static BigInteger shiftLeft(BigInteger number, int numShifts) {
+        return number.multiply(BigInteger.TEN.pow(numShifts));
+    }
+
+    /**
+     * Makes bulk withdrawals for all accounts in accounts in the TRS contract at address trsContract
+     * from the current period up into - and including! - period number stopPeriod.
+     */
+    private void makeWithdrawalsUntilPeriod(Address trsContract, IRepositoryCache repo,
+        List<Address> accounts, int stopPeriod) {
+
+        long time = TRSgetStartTime(trsContract, repo);
+        int periodInterval = TRSgetPeriodInterval(trsContract, repo);
+        while (TRSgetCurrentPeriod(trsContract, repo) <= stopPeriod) {
+            TRSbulkWithdrawal(trsContract, repo, accounts);
+            addBlock(time += periodInterval);
+        }
     }
 
     /**
@@ -2915,7 +3116,7 @@ public class TrsContractTest {
      * @return
      */
     private String TRSdeployCode() {
-        return "6050604052600060076000509090555b3360006000508282909180600101839055555050505b61002a565b61163a806100396000396000f300605060405236156101d5576000356c01000000000000000000000000900463ffffffff168063144fa6d7146101d9578063184274fc146102055780632392b0f01461023a5780632ddbd13a1461025e5780632ed94f6c14610288578063346a76e7146102e75780633a63aa8f146103465780633ccfd60b1461039957806343c885ba146103c75780634cbf867d146103f557806354469aea1461041f578063544736e6146104435780636ef610921461047157806372a02f1d146104b157806372b0d90c146104c757806377b7aa2c1461050b5780637965f1111461054357806379ba5097146105ab5780638da5cb5b146105c157806390e2b94b146105f2578063a06842511461061c578063a191fe2814610646578063a4caeb4214610673578063a6f9dae11461069d578063ac3dc9aa146106c9578063c255fa40146106f3578063c3af702e14610709578063cb13cddb14610733578063cf30901214610773578063d3b5dc3b146107a1578063d4ee1d90146107cb578063dd39472f146107fc578063e6c2776e14610834578063ece20f3614610869578063ef78d4fd1461087f578063f83d08ba146108a9578063f9df65eb146108bf578063fbb0eb8b146108ed578063fc0c546a14610917576101d5565b5b5b005b34156101e55760006000fd5b61020360048080806010013590359091602001909192905050610948565b005b34156102115760006000fd5b61023860048080806010013590359091602001909192908035906010019091905050610980565b005b34156102465760006000fd5b61025c6004808035906010019091905050610a71565b005b341561026a5760006000fd5b610272610b0c565b6040518082815260100191505060405180910390f35b34156102945760006000fd5b6102e560048080359060100190820180359060100191919080806020026010016040519081016040528093929190818152601001838360200280828437820191505050505050909091905050610b15565b005b34156102f35760006000fd5b61034460048080359060100190820180359060100191919080806010026010016040519081016040528093929190818152601001838360100280828437820191505050505050909091905050610b83565b005b34156103525760006000fd5b6103836004808035906010019091908035906010019091908035906010019091908035906010019091905050610c35565b6040518082815260100191505060405180910390f35b34156103a55760006000fd5b6103ad610c94565b604051808215151515815260100191505060405180910390f35b34156103d35760006000fd5b6103db610ccd565b604051808215151515815260100191505060405180910390f35b34156104015760006000fd5b610409610ce0565b6040518082815260100191505060405180910390f35b341561042b5760006000fd5b6104416004808035906010019091905050610ce5565b005b341561044f5760006000fd5b610457610d38565b604051808215151515815260100191505060405180910390f35b341561047d5760006000fd5b61049b60048080806010013590359091602001909192905050610d66565b6040518082815260100191505060405180910390f35b34156104bd5760006000fd5b6104c5610d88565b005b34156104d35760006000fd5b6104f160048080806010013590359091602001909192905050610de5565b604051808215151515815260100191505060405180910390f35b34156105175760006000fd5b61052d6004808035906010019091905050610f88565b6040518082815260100191505060405180910390f35b341561054f5760006000fd5b6105a960048080359060100190919080359060100190820180359060100191919080806010026010016040519081016040528093929190818152601001838360100280828437820191505050505050909091905050610fe1565b005b34156105b75760006000fd5b6105bf611165565b005b34156105cd5760006000fd5b6105d56111f2565b604051808383825281601001526020019250505060405180910390f35b34156105fe5760006000fd5b610606611201565b6040518082815260100191505060405180910390f35b34156106285760006000fd5b61063061120a565b6040518082815260100191505060405180910390f35b34156106525760006000fd5b6106716004808035906010019091908035906010019091905050611213565b005b341561067f5760006000fd5b610687611280565b6040518082815260100191505060405180910390f35b34156106a95760006000fd5b6106c760048080806010013590359091602001909192905050611289565b005b34156106d55760006000fd5b6106dd6112c5565b6040518082815260100191505060405180910390f35b34156106ff5760006000fd5b6107076112ce565b005b34156107155760006000fd5b61071d6113d8565b6040518082815260100191505060405180910390f35b341561073f5760006000fd5b61075d600480808060100135903590916020019091929050506113e1565b6040518082815260100191505060405180910390f35b341561077f5760006000fd5b610787611403565b604051808215151515815260100191505060405180910390f35b34156107ad5760006000fd5b6107b5611416565b6040518082815260100191505060405180910390f35b34156107d75760006000fd5b6107df61141b565b604051808383825281601001526020019250505060405180910390f35b34156108085760006000fd5b61081e600480803590601001909190505061142a565b6040518082815260100191505060405180910390f35b34156108405760006000fd5b61086760048080806010013590359091602001909192908035906010019091905050611468565b005b34156108755760006000fd5b61087d61154a565b005b341561088b5760006000fd5b610893611589565b6040518082815260100191505060405180910390f35b34156108b55760006000fd5b6108bd6115a4565b005b34156108cb5760006000fd5b6108d36115e3565b604051808215151515815260100191505060405180910390f35b34156108f95760006000fd5b6109016115f6565b6040518082815260100191505060405180910390f35b34156109235760006000fd5b61092b6115ff565b604051808383825281601001526020019250505060405180910390f35b600060005080600101549054339091149190141615156109685760006000fd5b8181600860005082828255906001015550505b5b5050565b600060005080600101549054339091149190141615156109a05760006000fd5b600660019054906101000a900460ff161580156109c257506000600760005054145b15156109ce5760006000fd5b600f60009054906101000a900460ff161515156109eb5760006000fd5b80600a60005060008585825281601001526020019081526010016000209050600082828250540192505081909090555080600b600082828250540192505081909090555082827fc6dcd8d437d8b3537583463d84a6ba9d7e3e013fa4e004da9b6dee1482038be5846040518082815260100191505060405180910390a25b5b5b5b505050565b600060006000508060010154905433909114919014161515610a935760006000fd5b600660009054906101000a900460ff161515610aaf5760006000fd5b600660019054906101000a900460ff168015610ad057506000600760005054145b1515610adc5760006000fd5b8160076000508190909055503031905080600d60005081909090555080600c6000508190909055505b5b5b5b5050565b600d6000505481565b6000600f60009054906101000a900460ff16151515610b345760006000fd5b600090505b8151811015610b7d57610b6e8282815181101515610b5357fe5b90601001906020020180601001519051610de563ffffffff16565b505b8080600101915050610b39565b5b5b5050565b6000600060006000600060006000508060010154905433909114919014161515610bad5760006000fd5b6bffffffffffffffffffffffff9450600093505b8551841015610c2b5760608685815181101515610bda57fe5b906010019060100201519060020a9004600092509250848685815181101515610bff57fe5b90601001906010020151169050610c1d83838361098063ffffffff16565b5b8380600101945050610bc1565b5b5b505050505050565b600060006000610c4a8561142a63ffffffff16565b91506064600b6000505485848a0202811515610c6257fe5b04811515610c6c57fe5b04905085811115610c81578581039250610c8a565b60009250610c8a565b5050949350505050565b6000600f60009054906101000a900460ff16151515610cb35760006000fd5b610cc233610de563ffffffff16565b9050610cc9565b5b90565b600660009054906101000a900460ff1681565b600381565b60006000508060010154905433909114919014161515610d055760006000fd5b600f60009054906101000a900460ff16151515610d225760006000fd5b610d32338361098063ffffffff16565b5b5b5b50565b6000600660019054906101000a900460ff168015610d5c5750600060076000505414155b9050610d63565b90565b600e600050602052818160005260105260306000209050600091509150505481565b60006000508060010154905433909114919014161515610da85760006000fd5b600660009054906101000a900460ff16151515610dc55760006000fd5b6001600660006101000a81548160ff0219169083151502179055505b5b5b565b6000600060006000600660019054906101000a900460ff168015610e0f5750600060076000505414155b1515610e1b5760006000fd5b600f60009054906101000a900460ff16151515610e385760006000fd5b600a60005060008787825281601001526020019081526010016000209050600050549250600e60005060008787825281601001526020019081526010016000209050600050549150610e97838342600d60005054610c3563ffffffff16565b90506000811415610eab5760009350610f7d565b600b60005054600d600050548402811515610ec257fe5b0482820111151515610ed45760006000fd5b85856108fc83908115029060405160006040518083038185898989f19450505050505080600e60005060008888825281601001526020019081526010016000209050600082828250540192505081909090555080600c600082828250540392505081909090555085857fb061022b0142dafc69e0206f0d1602f87e19faa0bd2befbf1d557f50a0dbb78e846040518082815260100191505060405180910390a260019350610f7d565b5b5b50505092915050565b60006000826007600050541115610fa25760009150610fdb565b600160036007600050548503811515610fb757fe5b04019050600460005054811115610fd357600460005054905080505b809150610fdb565b50919050565b6000600060006000600060006000600050806001015490543390911491901416151561100d5760006000fd5b600660019054906101000a900460ff1615801561102f57506000600760005054145b151561103b5760006000fd5b6010600050548814151561104e57611159565b6001601060008282825054019250508190909055506bffffffffffffffffffffffff955060009450600093505b8651841015611144576060878581518110151561109457fe5b906010019060100201519060020a90046000925092508587858151811015156110b957fe5b9060100190601002015116905080600a6000506000858582528160100152602001908152601001600020905060008282825054019250508190909055508085019450845082827fc6dcd8d437d8b3537583463d84a6ba9d7e3e013fa4e004da9b6dee1482038be5846040518082815260100191505060405180910390a25b838060010194505061107b565b84600b60008282825054019250508190909055505b5b5b5050505050505050565b6002600050806001015490543390911491901416156111ef5760026000508060010154905460006000508282909180600101839055555050506000600060026000508282909180600101839055555050506000600050806001015490547fa701229f4b9ddf00aa1c7228d248e6320ee7c581d856ddfba036e73947cd0d1360405160405180910390a25b5b565b60006000508060010154905482565b60056000505481565b600c6000505481565b600060005080600101549054339091149190141615156112335760006000fd5b600660009054906101000a900460ff161515156112505760006000fd5b600082141515156112615760006000fd5b8160046000508190909055508060056000508190909055505b5b5b5050565b60046000505481565b600060005080600101549054339091149190141615156112a95760006000fd5b818160026000508282909180600101839055555050505b5b5050565b60076000505481565b60006000600060005080600101549054339091149190141615156112f25760006000fd5b600660019054906101000a900460ff16151561130e5760006000fd5b6008600050806001015490546370a08231306000604051601001526040518363ffffffff166c0100000000000000000000000002815260040180838382528160100152602001925050506010604051808303816000888881813b15156113745760006000fd5b5af115156113825760006000fd5b50505050604051805190601001509150600c6000505482101515156113a75760006000fd5b600c600050548203905080600d600082828250540192505081909090555081600c6000508190909055505b5b5b5050565b600b6000505481565b600a600050602052818160005260105260306000209050600091509150505481565b600660019054906101000a900460ff1681565b606481565b60026000508060010154905482565b600060046000505460056000505401606461144a84610f8863ffffffff16565b600560005054010281151561145b57fe5b049050611463565b919050565b600060005080600101549054339091149190141615156114885760006000fd5b600660019054906101000a900460ff161580156114aa57506000600760005054145b15156114b65760006000fd5b60086000508060010154905463fbb001d68585856000604051601001526040518463ffffffff166c010000000000000000000000000281526004018084848252816010015260200182815260100193505050506010604051808303816000888881813b15156115255760006000fd5b5af115156115335760006000fd5b5050505060405180519060100150505b5b5b505050565b6000600050806001015490543390911491901416151561156a5760006000fd5b6001600f60006101000a81548160ff0219169083151502179055505b5b565b600061159a42610f8863ffffffff16565b90506115a1565b90565b600060005080600101549054339091149190141615156115c45760006000fd5b6001600660016101000a81548160ff0219169083151502179055505b5b565b600f60009054906101000a900460ff1681565b60106000505481565b600860005080600101549054825600a165627a7a72305820400b53c375468c4233d7ad4e200a5f9d797fa51a7796d97f5858ecfa2ff9ae9c0029";
+        return "6050604052600060076000509090555b3360006000508282909180600101839055555050505b61002a565b61163d806100396000396000f300605060405236156101d5576000356c01000000000000000000000000900463ffffffff168063144fa6d7146101d9578063184274fc146102055780632392b0f01461023a5780632ddbd13a1461025e5780632ed94f6c14610288578063346a76e7146102e75780633a63aa8f146103465780633ccfd60b1461039957806343c885ba146103c75780634cbf867d146103f557806354469aea1461041f578063544736e6146104435780636ef610921461047157806372a02f1d146104b157806372b0d90c146104c757806377b7aa2c1461050b5780637965f1111461054357806379ba5097146105ab5780638da5cb5b146105c157806390e2b94b146105f2578063a06842511461061c578063a191fe2814610646578063a4caeb4214610673578063a6f9dae11461069d578063ac3dc9aa146106c9578063c255fa40146106f3578063c3af702e14610709578063cb13cddb14610733578063cf30901214610773578063d3b5dc3b146107a1578063d4ee1d90146107cb578063dd39472f146107fc578063e6c2776e14610834578063ece20f3614610869578063ef78d4fd1461087f578063f83d08ba146108a9578063f9df65eb146108bf578063fbb0eb8b146108ed578063fc0c546a14610917576101d5565b5b5b005b34156101e55760006000fd5b61020360048080806010013590359091602001909192905050610948565b005b34156102115760006000fd5b61023860048080806010013590359091602001909192908035906010019091905050610980565b005b34156102465760006000fd5b61025c6004808035906010019091905050610a71565b005b341561026a5760006000fd5b610272610b0c565b6040518082815260100191505060405180910390f35b34156102945760006000fd5b6102e560048080359060100190820180359060100191919080806020026010016040519081016040528093929190818152601001838360200280828437820191505050505050909091905050610b15565b005b34156102f35760006000fd5b61034460048080359060100190820180359060100191919080806010026010016040519081016040528093929190818152601001838360100280828437820191505050505050909091905050610b83565b005b34156103525760006000fd5b6103836004808035906010019091908035906010019091908035906010019091908035906010019091905050610c35565b6040518082815260100191505060405180910390f35b34156103a55760006000fd5b6103ad610c95565b604051808215151515815260100191505060405180910390f35b34156103d35760006000fd5b6103db610cce565b604051808215151515815260100191505060405180910390f35b34156104015760006000fd5b610409610ce1565b6040518082815260100191505060405180910390f35b341561042b5760006000fd5b6104416004808035906010019091905050610ce6565b005b341561044f5760006000fd5b610457610d39565b604051808215151515815260100191505060405180910390f35b341561047d5760006000fd5b61049b60048080806010013590359091602001909192905050610d67565b6040518082815260100191505060405180910390f35b34156104bd5760006000fd5b6104c5610d89565b005b34156104d35760006000fd5b6104f160048080806010013590359091602001909192905050610de6565b604051808215151515815260100191505060405180910390f35b34156105175760006000fd5b61052d6004808035906010019091905050610f89565b6040518082815260100191505060405180910390f35b341561054f5760006000fd5b6105a960048080359060100190919080359060100190820180359060100191919080806010026010016040519081016040528093929190818152601001838360100280828437820191505050505050909091905050610fe2565b005b34156105b75760006000fd5b6105bf611166565b005b34156105cd5760006000fd5b6105d56111f3565b604051808383825281601001526020019250505060405180910390f35b34156105fe5760006000fd5b610606611202565b6040518082815260100191505060405180910390f35b34156106285760006000fd5b61063061120b565b6040518082815260100191505060405180910390f35b34156106525760006000fd5b6106716004808035906010019091908035906010019091905050611214565b005b341561067f5760006000fd5b610687611281565b6040518082815260100191505060405180910390f35b34156106a95760006000fd5b6106c76004808080601001359035909160200190919290505061128a565b005b34156106d55760006000fd5b6106dd6112c6565b6040518082815260100191505060405180910390f35b34156106ff5760006000fd5b6107076112cf565b005b34156107155760006000fd5b61071d6113d9565b6040518082815260100191505060405180910390f35b341561073f5760006000fd5b61075d600480808060100135903590916020019091929050506113e2565b6040518082815260100191505060405180910390f35b341561077f5760006000fd5b610787611404565b604051808215151515815260100191505060405180910390f35b34156107ad5760006000fd5b6107b5611417565b6040518082815260100191505060405180910390f35b34156107d75760006000fd5b6107df61141d565b604051808383825281601001526020019250505060405180910390f35b34156108085760006000fd5b61081e600480803590601001909190505061142c565b6040518082815260100191505060405180910390f35b34156108405760006000fd5b6108676004808080601001359035909160200190919290803590601001909190505061146b565b005b34156108755760006000fd5b61087d61154d565b005b341561088b5760006000fd5b61089361158c565b6040518082815260100191505060405180910390f35b34156108b55760006000fd5b6108bd6115a7565b005b34156108cb5760006000fd5b6108d36115e6565b604051808215151515815260100191505060405180910390f35b34156108f95760006000fd5b6109016115f9565b6040518082815260100191505060405180910390f35b34156109235760006000fd5b61092b611602565b604051808383825281601001526020019250505060405180910390f35b600060005080600101549054339091149190141615156109685760006000fd5b8181600860005082828255906001015550505b5b5050565b600060005080600101549054339091149190141615156109a05760006000fd5b600660019054906101000a900460ff161580156109c257506000600760005054145b15156109ce5760006000fd5b600f60009054906101000a900460ff161515156109eb5760006000fd5b80600a60005060008585825281601001526020019081526010016000209050600082828250540192505081909090555080600b600082828250540192505081909090555082827fc6dcd8d437d8b3537583463d84a6ba9d7e3e013fa4e004da9b6dee1482038be5846040518082815260100191505060405180910390a25b5b5b5b505050565b600060006000508060010154905433909114919014161515610a935760006000fd5b600660009054906101000a900460ff161515610aaf5760006000fd5b600660019054906101000a900460ff168015610ad057506000600760005054145b1515610adc5760006000fd5b8160076000508190909055503031905080600d60005081909090555080600c6000508190909055505b5b5b5b5050565b600d6000505481565b6000600f60009054906101000a900460ff16151515610b345760006000fd5b600090505b8151811015610b7d57610b6e8282815181101515610b5357fe5b90601001906020020180601001519051610de663ffffffff16565b505b8080600101915050610b39565b5b5b5050565b6000600060006000600060006000508060010154905433909114919014161515610bad5760006000fd5b6bffffffffffffffffffffffff9450600093505b8551841015610c2b5760608685815181101515610bda57fe5b906010019060100201519060020a9004600092509250848685815181101515610bff57fe5b90601001906010020151169050610c1d83838361098063ffffffff16565b5b8380600101945050610bc1565b5b5b505050505050565b600060006000610c4a8561142c63ffffffff16565b9150612710600b6000505485848a0202811515610c6357fe5b04811515610c6d57fe5b04905085811115610c82578581039250610c8b565b60009250610c8b565b5050949350505050565b6000600f60009054906101000a900460ff16151515610cb45760006000fd5b610cc333610de663ffffffff16565b9050610cca565b5b90565b600660009054906101000a900460ff1681565b600381565b60006000508060010154905433909114919014161515610d065760006000fd5b600f60009054906101000a900460ff16151515610d235760006000fd5b610d33338361098063ffffffff16565b5b5b5b50565b6000600660019054906101000a900460ff168015610d5d5750600060076000505414155b9050610d64565b90565b600e600050602052818160005260105260306000209050600091509150505481565b60006000508060010154905433909114919014161515610da95760006000fd5b600660009054906101000a900460ff16151515610dc65760006000fd5b6001600660006101000a81548160ff0219169083151502179055505b5b5b565b6000600060006000600660019054906101000a900460ff168015610e105750600060076000505414155b1515610e1c5760006000fd5b600f60009054906101000a900460ff16151515610e395760006000fd5b600a60005060008787825281601001526020019081526010016000209050600050549250600e60005060008787825281601001526020019081526010016000209050600050549150610e98838342600d60005054610c3563ffffffff16565b90506000811415610eac5760009350610f7e565b600b60005054600d600050548402811515610ec357fe5b0482820111151515610ed55760006000fd5b85856108fc83908115029060405160006040518083038185898989f19450505050505080600e60005060008888825281601001526020019081526010016000209050600082828250540192505081909090555080600c600082828250540392505081909090555085857fb061022b0142dafc69e0206f0d1602f87e19faa0bd2befbf1d557f50a0dbb78e846040518082815260100191505060405180910390a260019350610f7e565b5b5b50505092915050565b60006000826007600050541115610fa35760009150610fdc565b600160036007600050548503811515610fb857fe5b04019050600460005054811115610fd457600460005054905080505b809150610fdc565b50919050565b6000600060006000600060006000600050806001015490543390911491901416151561100e5760006000fd5b600660019054906101000a900460ff1615801561103057506000600760005054145b151561103c5760006000fd5b6010600050548814151561104f5761115a565b6001601060008282825054019250508190909055506bffffffffffffffffffffffff955060009450600093505b8651841015611145576060878581518110151561109557fe5b906010019060100201519060020a90046000925092508587858151811015156110ba57fe5b9060100190601002015116905080600a6000506000858582528160100152602001908152601001600020905060008282825054019250508190909055508085019450845082827fc6dcd8d437d8b3537583463d84a6ba9d7e3e013fa4e004da9b6dee1482038be5846040518082815260100191505060405180910390a25b838060010194505061107c565b84600b60008282825054019250508190909055505b5b5b5050505050505050565b6002600050806001015490543390911491901416156111f05760026000508060010154905460006000508282909180600101839055555050506000600060026000508282909180600101839055555050506000600050806001015490547fa701229f4b9ddf00aa1c7228d248e6320ee7c581d856ddfba036e73947cd0d1360405160405180910390a25b5b565b60006000508060010154905482565b60056000505481565b600c6000505481565b600060005080600101549054339091149190141615156112345760006000fd5b600660009054906101000a900460ff161515156112515760006000fd5b600082141515156112625760006000fd5b8160046000508190909055508060056000508190909055505b5b5b5050565b60046000505481565b600060005080600101549054339091149190141615156112aa5760006000fd5b818160026000508282909180600101839055555050505b5b5050565b60076000505481565b60006000600060005080600101549054339091149190141615156112f35760006000fd5b600660019054906101000a900460ff16151561130f5760006000fd5b6008600050806001015490546370a08231306000604051601001526040518363ffffffff166c0100000000000000000000000002815260040180838382528160100152602001925050506010604051808303816000888881813b15156113755760006000fd5b5af115156113835760006000fd5b50505050604051805190601001509150600c6000505482101515156113a85760006000fd5b600c600050548203905080600d600082828250540192505081909090555081600c6000508190909055505b5b5b5050565b600b6000505481565b600a600050602052818160005260105260306000209050600091509150505481565b600660019054906101000a900460ff1681565b61271081565b60026000508060010154905482565b60006004600050546005600050540161271061144d84610f8963ffffffff16565b600560005054010281151561145e57fe5b049050611466565b919050565b6000600050806001015490543390911491901416151561148b5760006000fd5b600660019054906101000a900460ff161580156114ad57506000600760005054145b15156114b95760006000fd5b60086000508060010154905463fbb001d68585856000604051601001526040518463ffffffff166c010000000000000000000000000281526004018084848252816010015260200182815260100193505050506010604051808303816000888881813b15156115285760006000fd5b5af115156115365760006000fd5b5050505060405180519060100150505b5b5b505050565b6000600050806001015490543390911491901416151561156d5760006000fd5b6001600f60006101000a81548160ff0219169083151502179055505b5b565b600061159d42610f8963ffffffff16565b90506115a4565b90565b600060005080600101549054339091149190141615156115c75760006000fd5b6001600660016101000a81548160ff0219169083151502179055505b5b565b600f60009054906101000a900460ff1681565b60106000505481565b600860005080600101549054825600a165627a7a723058207330977f143ddc0443cbdf8a24592705528c4e5f8db5866792270495cfa7cc830029";
     }
 
 }
