@@ -2,6 +2,8 @@ package org.aion.fastvm;
 
 import java.math.BigInteger;
 import java.util.List;
+import org.aion.base.db.IRepositoryCache;
+import org.aion.base.vm.DebugInfo;
 import org.aion.mcf.vm.types.KernelInterfaceForFastVM;
 import org.aion.vm.api.interfaces.Address;
 import org.aion.vm.api.interfaces.KernelInterface;
@@ -9,6 +11,7 @@ import org.aion.vm.api.interfaces.SimpleFuture;
 import org.aion.vm.api.interfaces.TransactionContext;
 import org.aion.vm.api.interfaces.TransactionResult;
 import org.aion.vm.api.interfaces.VirtualMachine;
+import org.aion.zero.db.AionRepositoryCache;
 import org.aion.zero.types.AionTransaction;
 
 public class FastVirtualMachine implements VirtualMachine {
@@ -51,10 +54,17 @@ public class FastVirtualMachine implements VirtualMachine {
             transactionResults[i] = new FastVmSimpleFuture();
             transactionResults[i].result = executor.execute();
 
+            if (DebugInfo.currentBlockNumber == 257159) {
+                DebugInfo.currentPipelineStage = "FVM result.getKernelInterface.flushTo(kernelSnapshot, false)";
+            }
+
             // We want to flush back up to the snapshot without losing any state, so that we can pass that state to the caller.
-            ((KernelInterfaceForFastVM) transactionResults[i].result.getKernelInterface())
-                .getRepositoryCache()
-                .flushTo(((KernelInterfaceForFastVM) this.kernelSnapshot).getRepositoryCache(), false);
+            IRepositoryCache cache = ((KernelInterfaceForFastVM) transactionResults[i].result.getKernelInterface()).getRepositoryCache();
+            ((AionRepositoryCache) cache).flushCopyTo(((KernelInterfaceForFastVM) this.kernelSnapshot).getRepositoryCache(), false);
+
+//            ((KernelInterfaceForFastVM) transactionResults[i].result.getKernelInterface())
+//                .getRepositoryCache()
+//                .flushTo(((KernelInterfaceForFastVM) this.kernelSnapshot).getRepositoryCache(), false);
 
             // Mock the updateRepo call
             TransactionResult txResult = transactionResults[i].result;
@@ -87,6 +97,10 @@ public class FastVirtualMachine implements VirtualMachine {
                 for (Address addr : deleteAccounts) {
                     snapshotTracker.deleteAccount(addr);
                 }
+            }
+
+            if (DebugInfo.currentBlockNumber == 257159) {
+                DebugInfo.currentPipelineStage = "FVM snapshotTracker.commit()";
             }
             snapshotTracker.commit();
         }

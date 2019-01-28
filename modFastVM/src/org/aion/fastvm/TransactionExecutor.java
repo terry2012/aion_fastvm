@@ -23,6 +23,7 @@
 package org.aion.fastvm;
 
 import java.math.BigInteger;
+import org.aion.base.vm.DebugInfo;
 import org.aion.precompiled.ContractFactory;
 import org.aion.precompiled.type.PrecompiledContract;
 import org.aion.vm.api.interfaces.Address;
@@ -110,15 +111,24 @@ public class TransactionExecutor {
 
             // kernelGrandchild holds all state changes that must be flushed upon SUCCESS.
             if (transactionResult.getResultCode().isSuccess()) {
+                if (DebugInfo.currentBlockNumber == 257159) {
+                    DebugInfo.currentPipelineStage = "TxExe kernelGrandChild.commit()";
+                }
                 this.kernelGrandChild.commit();
             }
 
             // kernelChild holds state changes that must be flushed on anything that is not
             // REJECTED.
             if (!transactionResult.getResultCode().isRejected()) {
+                if (DebugInfo.currentBlockNumber == 257159) {
+                    DebugInfo.currentPipelineStage = "TxExe kernelChild.commit()";
+                }
                 this.kernelChild.commit();
             }
 
+            if (DebugInfo.currentBlockNumber == 257159) {
+                DebugInfo.currentPipelineStage = "TxExe kernel.commit()";
+            }
             transactionResult.setKernelInterface(this.kernel);
             return transactionResult;
         }
